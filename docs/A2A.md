@@ -92,7 +92,7 @@ JSON 轮询展示远端状态；关闭页面或切换项目只中止观察，不
 - `message_id` 在实例内持久唯一，参数指纹必须一致；复用不同参数被拒绝。同参数重试映射原 run。
 - 新 run、配置快照、`a2a_origin` 与幂等绑定在同一事务内创建，随后才提交本地 worker。
 - 本地委托登记也持久化；刷新后可查看历史。PENDING 需要用原 message_id 和参数重试确认，不能编造远端 Task ID。
-- 断网/响应丢失不能保证远端已取消。高层 `delegate_wait` 超时或被取消会尝试有界清理；发送响应完全丢失时可能只留下 PENDING，需核对远端。
+- 高层 `delegate_wait` 保留同一次在途发送。超时或取消后，分别最多等待5秒取得持久ACK、5秒请求远端取消、5秒回收发送协程；不会重新发送POST。重复取消不会中断这次清理。断网或ACK完全丢失时仍可能只留下PENDING，不能保证远端已取消，需核对远端。
 - 只有 `TASK_STATE_COMPLETED` 是研究成功；FAILED/CANCELED/REJECTED/INPUT_REQUIRED/AUTH_REQUIRED 等不会当成成功报告。
 - 完成任务不可取消；GetTask 与 CancelTask 之间完成的竞态也返回安全 409。
 - 远端进程重启后运行转 interrupted，可经远端业务 API 手动恢复；不会自动重新创建任务。

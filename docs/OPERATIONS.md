@@ -188,7 +188,7 @@ uv run signaldesk-eval --output data/evaluation.json
 来源限制、引用拒绝、Deep Agents 实图与脚本模型、Skills 读取、只读 MCP 以及项目历史隔离。
 脚本模型只用于验证真实框架的调用接口，不代表真实模型效果。
 
-完整回归169项通过。实际PostgreSQL测试4项、实际Docker测试3项，其中一项PG测试结合Docker；按环境变量明确启用，缺少条件会跳过。
+完整回归174项通过。实际PostgreSQL测试4项、实际Docker测试3项，其中一项PG测试结合Docker；按环境变量明确启用，缺少条件会跳过。
 实际数据库测试覆盖 GIN 全文、向量、Store、checkpointer 和应用整体；嵌入输入是确定性夹具，不调用供应商。
 Chrome 已验证 SSE 续传、项目切换、记忆 CRUD 和服务重启持久化。
 

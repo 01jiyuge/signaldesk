@@ -26,6 +26,9 @@ from signaldesk.a2a_store import A2ARequestStore, IdempotencyConflict
 from signaldesk.errors import PublicTaskError
 
 MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
+SEND_ACK_GRACE_SECONDS = 5
+REMOTE_CANCEL_GRACE_SECONDS = 5
+SEND_DRAIN_GRACE_SECONDS = 5
 
 
 class BoundedResponseStream(httpx.AsyncByteStream):
@@ -208,6 +211,7 @@ class A2ADelegate:
         mode="demo",
         demo_revision=1,
         message_id: str,
+        _acknowledged: asyncio.Future | None = None,
     ) -> dict:
         command = A2ACommand(project_id=remote_project_id, mode=mode, demo_revision=demo_revision)
         command.run_payload()
@@ -246,7 +250,10 @@ class A2ADelegate:
                 self._check_project(response.task, remote_project_id)
                 task = MessageToDict(response.task)
                 await self.bindings.record_task(record["id"], task)
-                return self._public({**record, "task": task, "status": task["status"]["state"]})
+                result = self._public({**record, "task": task, "status": task["status"]["state"]})
+                if _acknowledged is not None and not _acknowledged.done():
+                    _acknowledged.set_result(result)
+                return result
             raise ValueError("Remote did not return a task")
 
     async def get(self, delegation_id: str) -> dict:
@@ -309,28 +316,83 @@ class A2ADelegate:
         if any(event.kind == "a2a_origin" for event in await self.repo.list_events(local_run_id)):
             raise PublicTaskError("入站 A2A 任务不可继续自动委托。", code="a2a_recursion_blocked")
         record = None
+        acknowledged = asyncio.get_running_loop().create_future()
+        # Own this single attempt, including its HTTP client closure and local
+        # record_task commit. Cancellation of the waiter must not destroy an
+        # acknowledgement for a task the remote has already accepted.
+        send_task = asyncio.create_task(
+            self.send(
+                remote,
+                remote_project_id,
+                local_project_id=local_project_id,
+                local_run_id=local_run_id,
+                message_id=message_id,
+                mode=mode,
+                demo_revision=demo_revision,
+                _acknowledged=acknowledged,
+            ),
+            name=f"a2a-send-{local_run_id}",
+        )
 
         async def cleanup():
-            if record is not None:
-                try:
-                    async with asyncio.timeout(5):
+            nonlocal record
+            try:
+                if record is None:
+                    try:
+                        done, _ = await asyncio.wait(
+                            {send_task, acknowledged},
+                            timeout=SEND_ACK_GRACE_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        # The durable acknowledgement can precede the SDK
+                        # context's HTTP-client close. Do not lose that known
+                        # task ID just because closing the send is still pending.
+                        if acknowledged in done:
+                            record = acknowledged.result()
+                        elif send_task in done:
+                            record = send_task.result()
+                    except (Exception, asyncio.CancelledError):
+                        # No second POST: an absent acknowledgement remains
+                        # unconfirmed, and the original attempt is drained below.
+                        pass
+                if record is not None:
+                    async with asyncio.timeout(REMOTE_CANCEL_GRACE_SECONDS):
                         await self.cancel(record["id"])
-                except Exception:
-                    pass  # Best effort only: network failure cannot prove remote cancellation.
+            except Exception:
+                pass  # Best effort only: network failure cannot prove remote cancellation.
+            finally:
+                if not send_task.done():
+                    send_task.cancel()
+                # Drain the owned, cancellation-cooperative SDK/HTTP request,
+                # including its finally/close. This gets its own finite budget
+                # rather than an unbounded await after the ACK deadline expires.
+                try:
+                    async with asyncio.timeout(SEND_DRAIN_GRACE_SECONDS):
+                        await asyncio.gather(send_task, return_exceptions=True)
+                except TimeoutError:
+                    pass
+                if not acknowledged.done():
+                    acknowledged.cancel()
+
+        async def finish_cleanup():
+            cleanup_task = asyncio.create_task(cleanup(), name=f"a2a-cleanup-{local_run_id}")
+            cancelled_again = False
+            # A caller can cancel more than once, including while a timeout is
+            # being handled. Preserve cleanup ownership until the same cleanup
+            # finishes; a bare shield await would leave it in the background.
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    cancelled_again = True
+            cleanup_task.result()
+            return cancelled_again
 
         try:
             async with asyncio.timeout(
                 timeout_seconds or getattr(self.settings, "a2a_timeout_seconds", 180)
             ):
-                record = await self.send(
-                    remote,
-                    remote_project_id,
-                    local_project_id=local_project_id,
-                    local_run_id=local_run_id,
-                    message_id=message_id,
-                    mode=mode,
-                    demo_revision=demo_revision,
-                )
+                record = await asyncio.shield(send_task)
                 while record["status"] in {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"}:
                     await asyncio.sleep(0.2)
                     record = await self.get(record["id"])
@@ -342,15 +404,15 @@ class A2ADelegate:
                     )
                 return record
         except TimeoutError as exc:
-            await cleanup()
+            if await finish_cleanup():
+                raise asyncio.CancelledError() from None
             raise PublicTaskError(
                 "等待远端 A2A 任务超时；已尽力请求取消，请核对登记委托状态。",
                 code="a2a_timeout",
                 retryable=True,
             ) from exc
         except asyncio.CancelledError:
-            cleanup_task = asyncio.create_task(cleanup())
-            await asyncio.shield(cleanup_task)
+            await finish_cleanup()
             raise
 
 

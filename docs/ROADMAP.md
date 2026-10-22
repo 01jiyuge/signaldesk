@@ -18,7 +18,7 @@
 
 ## 2. 本轮验证记录
 
-- Python 3.14.6；完整回归 **169 passed**，包含真实 PostgreSQL 的 4 项和真实 Docker 的 3 项集成测试（其中一项PG结合Docker）。
+- Python 3.14.6；完整回归 **174 passed**，包含真实 PostgreSQL 的 4 项和真实 Docker 的 3 项集成测试（其中一项PG结合Docker）。
 - 实际 PostgreSQL 18.4 + pgvector 0.8.7：全文与 GIN、项目/最新成功快照隔离、真实向量距离、相同正文向量复用、Store 关闭重开、检查点恢复、FastAPI 整体生命周期通过。测试在独立本地库/随机 schema 中执行。
 - `signaldesk-eval`：9/9 固定夹具场景、55/55 项期望匹配。衡量 demo、变化判断和引用拒绝，不代表真实模型质量或人工事实支持率。
 - Chrome 实测：AG-UI 返回 `text/event-stream`，断线后从已接收事件游标续传；切项目取消旧订阅且不取消后台运行；偏好新增/编辑/删除；服务重启后偏好与运行摘要保留；不同项目记忆不串入。

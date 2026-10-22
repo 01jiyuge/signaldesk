@@ -814,3 +814,272 @@ async def test_official_sdk_cancel_race_becomes_safe_http_conflict(protocol_syst
         and "fixture-remote-secret" not in response.text
     )
     assert calls == ["GetTask", "CancelTask", "GetTask", "CancelTask"]
+
+
+async def test_cancellation_after_remote_acceptance_waits_for_same_http_ack(
+    protocol_system, tmp_path
+):
+    from signaldesk.schemas import RunCreate
+
+    remote_repo, jobs, app, http, remote_project, remote_settings, started = protocol_system
+    accepted, release_ack = asyncio.Event(), asyncio.Event()
+    send_count = 0
+
+    class DelayAcceptedResponse:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        async def __call__(self, scope, receive, send):
+            import json
+
+            body = bytearray()
+            method = None
+
+            async def read():
+                nonlocal method, send_count
+                message = await receive()
+                if message["type"] == "http.request":
+                    body.extend(message.get("body", b""))
+                    if not message.get("more_body", False) and body:
+                        method = json.loads(body).get("method")
+                        if method == "SendMessage":
+                            send_count += 1
+                return message
+
+            async def write(message):
+                if method == "SendMessage" and message["type"] == "http.response.start":
+                    # The server has created/submitted the task. Keep the
+                    # actual HTTP acknowledgement from reaching the client.
+                    accepted.set()
+                    await release_ack.wait()
+                await send(message)
+
+            await self.wrapped(scope, read, write)
+
+    local_settings = settings_for(
+        tmp_path, "delayed-ack", a2a_remote_projects={"researcher": remote_project.id}
+    )
+    local_repo = Repository(local_settings)
+    await local_repo.initialize()
+    local_project = await local_repo.create_project(
+        ProjectCreate(
+            name="Local ACK fixture",
+            sources=[{"name": "Orbit", "url": "https://orbit.example/changelog"}],
+        )
+    )
+    local_run = await local_repo.create_run(local_project.id, RunCreate())
+    waiter = None
+    try:
+        async with running_server(
+            None,
+            factory=lambda url: DelayAcceptedResponse(
+                application(
+                    remote_repo,
+                    jobs,
+                    remote_settings.model_copy(update={"a2a_public_url": url + "/a2a/"}),
+                )
+            ),
+        ) as remote_url:
+            local_settings = local_settings.model_copy(
+                update={
+                    "a2a_remote_agents": {"researcher": remote_url + "/a2a/"},
+                    "a2a_remote_tokens": {"researcher": "fixture-remote-token"},
+                }
+            )
+            delegate = A2ADelegate(local_settings, local_repo)
+            waiter = asyncio.create_task(
+                delegate.delegate_wait(
+                    "researcher",
+                    remote_project.id,
+                    local_project_id=local_project.id,
+                    local_run_id=local_run.id,
+                    message_id="cancel-before-http-ack",
+                    mode="demo",
+                )
+            )
+            await asyncio.wait_for(accepted.wait(), 2)
+            await asyncio.wait_for(started.wait(), 2)
+            assert (await remote_repo.list_runs())[0].status == "running"
+            # Cancel strictly while send has not received the response; release
+            # the same response afterwards, rather than sleeping or retrying.
+            waiter.cancel()
+            release_ack.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(waiter, 3)
+            remote_run = (await remote_repo.list_runs())[0]
+            assert remote_run.status == "cancelled"
+            assert not jobs.is_active(remote_run.id)
+            assert send_count == 1
+            records = await delegate.list(local_project.id)
+            assert len(records) == 1
+            assert records[0]["status"] == "TASK_STATE_CANCELED"
+            assert records[0]["task"]["id"] == remote_run.id
+    finally:
+        release_ack.set()
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        await local_repo.close()
+
+
+@pytest.mark.parametrize("stop", ["cancel-twice", "timeout-then-cancel"])
+async def test_delegation_cleanup_owns_send_through_repeated_cancellation(
+    protocol_system, monkeypatch, stop
+):
+    from signaldesk.schemas import RunCreate
+
+    repo, jobs, app, http, project, settings, started = protocol_system
+    local_run = await repo.create_run(project.id, RunCreate())
+    settings = settings.model_copy(update={"a2a_remote_projects": {"researcher": "remote-project"}})
+    delegate = A2ADelegate(settings, repo)
+    accepted, release_ack = asyncio.Event(), asyncio.Event()
+    cancelling, release_cancel = asyncio.Event(), asyncio.Event()
+    owned_sends, calls = [], []
+
+    async def delayed_send(*args, **kwargs):
+        calls.append("send")
+        owned_sends.append(asyncio.current_task())
+        accepted.set()
+        await release_ack.wait()
+        return {"id": "same-delegation", "status": "TASK_STATE_WORKING"}
+
+    async def delayed_cancel(delegation_id):
+        assert delegation_id == "same-delegation"
+        calls.append("cancel")
+        cancelling.set()
+        await release_cancel.wait()
+        return {"id": delegation_id, "status": "TASK_STATE_CANCELED"}
+
+    monkeypatch.setattr(delegate, "send", delayed_send)
+    monkeypatch.setattr(delegate, "cancel", delayed_cancel)
+    waiter = asyncio.create_task(
+        delegate.delegate_wait(
+            "researcher",
+            "remote-project",
+            local_project_id=project.id,
+            local_run_id=local_run.id,
+            message_id=stop,
+            mode="demo",
+            timeout_seconds=0.01 if stop == "timeout-then-cancel" else 5,
+        )
+    )
+    try:
+        await asyncio.wait_for(accepted.wait(), 1)
+        if stop == "cancel-twice":
+            waiter.cancel()
+        release_ack.set()
+        await asyncio.wait_for(cancelling.wait(), 1)
+        # Interrupt cleanup itself. It must remain owned by this invocation,
+        # then propagate cancellation rather than returning a timeout failure.
+        waiter.cancel()
+        release_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 1)
+        assert calls == ["send", "cancel"]
+        assert len(owned_sends) == 1 and owned_sends[0].done()
+        assert not any(
+            task.get_name() == f"a2a-cleanup-{local_run.id}" for task in asyncio.all_tasks()
+        )
+    finally:
+        release_ack.set()
+        release_cancel.set()
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def test_unacknowledged_send_is_cancelled_and_drained_after_finite_grace(
+    protocol_system, monkeypatch
+):
+    from signaldesk.schemas import RunCreate
+
+    repo, jobs, app, http, project, settings, started = protocol_system
+    local_run = await repo.create_run(project.id, RunCreate())
+    settings = settings.model_copy(update={"a2a_remote_projects": {"researcher": "remote-project"}})
+    delegate = A2ADelegate(settings, repo)
+    accepted, drained = asyncio.Event(), asyncio.Event()
+    sends = []
+
+    async def no_ack(*args, **kwargs):
+        sends.append(asyncio.current_task())
+        accepted.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+
+    async def no_remote_id(*args, **kwargs):
+        raise AssertionError("Without an acknowledged task ID no cancellation POST is possible")
+
+    monkeypatch.setattr(delegate, "send", no_ack)
+    monkeypatch.setattr(delegate, "cancel", no_remote_id)
+    monkeypatch.setattr("signaldesk.a2a_client.SEND_ACK_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr("signaldesk.a2a_client.SEND_DRAIN_GRACE_SECONDS", 0.1)
+    waiter = asyncio.create_task(
+        delegate.delegate_wait(
+            "researcher",
+            "remote-project",
+            local_project_id=project.id,
+            local_run_id=local_run.id,
+            message_id="no-ack",
+            mode="demo",
+            timeout_seconds=0.01,
+        )
+    )
+    await asyncio.wait_for(accepted.wait(), 1)
+    with pytest.raises(PublicTaskError) as caught:
+        await asyncio.wait_for(waiter, 1)
+    assert caught.value.code == "a2a_timeout"
+    assert len(sends) == 1 and sends[0].done() and drained.is_set()
+    assert not any(
+        task.get_name() in {f"a2a-send-{local_run.id}", f"a2a-cleanup-{local_run.id}"}
+        for task in asyncio.all_tasks()
+    )
+
+
+async def test_known_durable_ack_survives_pending_send_client_close(protocol_system, monkeypatch):
+    from signaldesk.schemas import RunCreate
+
+    repo, jobs, app, http, project, settings, started = protocol_system
+    local_run = await repo.create_run(project.id, RunCreate())
+    settings = settings.model_copy(update={"a2a_remote_projects": {"researcher": "remote-project"}})
+    delegate = A2ADelegate(settings, repo)
+    closing, closed = asyncio.Event(), asyncio.Event()
+    calls, sends = [], []
+    acknowledged = {"id": "durable-before-close", "status": "TASK_STATE_WORKING"}
+
+    async def closing_send(*args, **kwargs):
+        calls.append("send")
+        sends.append(asyncio.current_task())
+        # send records this result after the DB commit, before leaving its
+        # SDK/client context. Closing the context can still be asynchronous.
+        kwargs["_acknowledged"].set_result(acknowledged)
+        closing.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def cancel_known(delegation_id):
+        assert delegation_id == acknowledged["id"]
+        calls.append("cancel")
+        return {**acknowledged, "status": "TASK_STATE_CANCELED"}
+
+    monkeypatch.setattr(delegate, "send", closing_send)
+    monkeypatch.setattr(delegate, "cancel", cancel_known)
+    waiter = asyncio.create_task(
+        delegate.delegate_wait(
+            "researcher",
+            "remote-project",
+            local_project_id=project.id,
+            local_run_id=local_run.id,
+            message_id="close-after-ack",
+            mode="demo",
+        )
+    )
+    await asyncio.wait_for(closing.wait(), 1)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, 1)
+    assert calls == ["send", "cancel"]
+    assert len(sends) == 1 and sends[0].done() and closed.is_set()
