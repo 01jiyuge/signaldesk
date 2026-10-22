@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "suite": "signaldesk-fixture-quality-v1",
+  "description": "固定虚构夹具的质量回归集；不评估真实模型、人工事实支持率或市场信息真实性。",
+  "cases": [
+    {
+      "id": "initial_baseline",
+      "scenario": "baseline",
+      "description": "首次采集建立两个来源基线，不伪称新品发布。",
+      "expected": {"finding_count": 2, "baseline_sources": 2, "changed_sources": 0, "citation_ids_valid": true, "citation_quotes_valid": true, "baseline_is_initial": true}
+    },
+    {
+      "id": "known_fixture_changes",
+      "scenario": "change",
+      "description": "比较v1/v2的价格、席位、API与Enterprise SSO变化，并核对新旧引用。",
+      "expected": {"finding_count": 2, "baseline_sources": 0, "changed_sources": 2, "citation_ids_valid": true, "citation_quotes_valid": true, "fact_fields": {"price_before": 29, "price_after": 39, "seats_before": 5, "seats_after": 10, "api_added": true, "sso_enterprise_added": true}}
+    },
+    {
+      "id": "unchanged_skip_research",
+      "scenario": "nochange",
+      "description": "相同正文和关注点走真实工作流节点的短路分支，不调用研究函数。",
+      "expected": {"finding_count": 0, "unchanged_sources": 2, "no_change": true, "research_calls": 0, "model_call_skipped": true, "context_changed": false}
+    },
+    {
+      "id": "reject_unknown_citation_id",
+      "scenario": "citation_invalid_id",
+      "description": "真实引用校验器必须拒绝不存在的证据ID。",
+      "expected": {"citation_rejected": true, "citation_ids_valid": false, "citation_quotes_valid": false}
+    },
+    {
+      "id": "reject_invented_quote",
+      "scenario": "citation_invalid_quote",
+      "description": "真实引用校验器必须拒绝不在原文内的引句。",
+      "expected": {"citation_rejected": true, "citation_ids_valid": true, "citation_quotes_valid": false}
+    },
+    {
+      "id": "partial_coverage_is_visible",
+      "scenario": "coverage",
+      "description": "第三个来源不可读取时保留覆盖缺口，不把其余来源相同写成全项目无变化。",
+      "expected": {"finding_count": 0, "total_sources": 3, "collected_sources": 2, "failed_sources": 1, "unchanged_sources": 2, "no_change": true, "coverage_limited": true}
+    },
+    {
+      "id": "project_scope_isolation",
+      "scenario": "project_scope",
+      "description": "历史搜索仅返回请求项目的证据，另一项目的同词证据不应混入。",
+      "expected": {"project_scope_ok": true, "search_result_count": 1}
+    },
+    {
+      "id": "focus_change_reanalyzes",
+      "scenario": "context_change",
+      "parameters": {"field": "focus"},
+      "description": "正文不变但关注点改变，必须进入研究分支；采用本地脚本研究函数。",
+      "expected": {"unchanged_sources": 2, "research_calls": 1, "model_call_skipped": false, "context_changed": true}
+    },
+    {
+      "id": "description_change_reanalyzes",
+      "scenario": "context_change",
+      "parameters": {"field": "description"},
+      "description": "正文不变但研究说明改变，也必须重新分析。",
+      "expected": {"unchanged_sources": 2, "research_calls": 1, "model_call_skipped": false, "context_changed": true}
+    }
+  ]
+}

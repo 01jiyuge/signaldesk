@@ -1,0 +1,57 @@
+name: signaldesk
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: signaldesk
+      POSTGRES_USER: signaldesk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-signaldesk-local-only}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U signaldesk -d signaldesk"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://signaldesk:${POSTGRES_PASSWORD:-signaldesk-local-only}@postgres:5432/signaldesk
+      CHECKPOINT_URL: postgresql://signaldesk:${POSTGRES_PASSWORD:-signaldesk-local-only}@postgres:5432/signaldesk
+      MEMORY_URL: postgresql://signaldesk:${POSTGRES_PASSWORD:-signaldesk-local-only}@postgres:5432/signaldesk
+      MODEL: ${MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      API_TOKEN: ${API_TOKEN:-}
+      ENABLE_VECTOR_SEARCH: ${ENABLE_VECTOR_SEARCH:-false}
+      ENABLE_FULLTEXT_SEARCH: ${ENABLE_FULLTEXT_SEARCH:-true}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      RERANKER_PROVIDER: ${RERANKER_PROVIDER:-lexical}
+      RERANKER_URL: ${RERANKER_URL:-}
+      RERANKER_API_KEY: ${RERANKER_API_KEY:-}
+      RERANKER_MODEL: ${RERANKER_MODEL:-}
+      MCP_URLS: ${MCP_URLS:-[]}
+      MCP_ALLOWED_TOOLS: ${MCP_ALLOWED_TOOLS:-[]}
+      ENABLE_A2A: ${ENABLE_A2A:-false}
+      A2A_PUBLIC_URL: ${A2A_PUBLIC_URL:-http://127.0.0.1:8000/a2a/}
+      A2A_REMOTE_AGENTS: ${A2A_REMOTE_AGENTS:-{}}
+      A2A_REMOTE_TOKENS: ${A2A_REMOTE_TOKENS:-{}}
+      A2A_REMOTE_PROJECTS: ${A2A_REMOTE_PROJECTS:-{}}
+      A2A_TIMEOUT_SECONDS: ${A2A_TIMEOUT_SECONDS:-180}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-signaldesk}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
