@@ -3,11 +3,13 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from signaldesk.errors import public_failure
 from signaldesk.repository import Repository
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class JobManager:
@@ -18,12 +20,58 @@ class JobManager:
         self.runner = runner
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent_runs))
         self._tasks: dict[str, asyncio.Task] = {}
+        self._operations: set[asyncio.Task] = set()
+        self._run_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._shutdown_task: asyncio.Task | None = None
         self._closing = False
+
+    @staticmethod
+    async def _join_owned(task: asyncio.Task[T]) -> T:
+        """A disconnected caller still owns its requested state transition."""
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            # Consume any failure without replacing the caller's cancellation.
+            if not task.cancelled():
+                task.exception()
+            raise asyncio.CancelledError
+        return task.result()
+
+    async def transition(self, run_id: str, operation: Callable[[], Awaitable[T]]) -> T:
+        """Serialize resume/cancel, and drain their writes before resources close."""
+        if self._closing:
+            raise RuntimeError("Job manager is shutting down")
+
+        async def serialized() -> T:
+            lock, participants = self._run_locks.get(run_id, (asyncio.Lock(), 0))
+            self._run_locks[run_id] = (lock, participants + 1)
+            try:
+                async with lock:
+                    if self._closing:
+                        raise RuntimeError("Job manager is shutting down")
+                    return await operation()
+            finally:
+                _, participants = self._run_locks[run_id]
+                if participants == 1:
+                    del self._run_locks[run_id]
+                else:
+                    self._run_locks[run_id] = (lock, participants - 1)
+
+        task = asyncio.create_task(serialized(), name=f"transition-{run_id}")
+        self._operations.add(task)
+        task.add_done_callback(self._operations.discard)
+        return await self._join_owned(task)
 
     def is_active(self, run_id: str) -> bool:
         """Keep observers open until the producer has finished all final writes."""
         task = self._tasks.get(run_id)
-        return task is not None and not task.done()
+        return (task is not None and not task.done()) or run_id in self._run_locks
 
     def submit(self, run_id: str, resume: bool = False) -> None:
         if self._closing:
@@ -77,6 +125,9 @@ class JobManager:
                 self._tasks.pop(run_id, None)
 
     async def cancel(self, run_id: str) -> None:
+        await self.transition(run_id, lambda: self._cancel(run_id))
+
+    async def _cancel(self, run_id: str) -> None:
         run = await self.repo.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -88,7 +139,8 @@ class JobManager:
         if task and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self._tasks.pop(run_id, None)
+        if self._tasks.get(run_id) is task:
+            self._tasks.pop(run_id, None)
         current = await self.repo.get_run(run_id)
         if current and current.status == "completed":
             raise ValueError("The report finished before cancellation")
@@ -105,6 +157,14 @@ class JobManager:
 
     async def shutdown(self) -> None:
         self._closing = True
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._shutdown(), name="research-shutdown")
+        await self._join_owned(self._shutdown_task)
+
+    async def _shutdown(self) -> None:
+        # An HTTP caller may have disconnected while its transition is still
+        # committing cancellation or rolling back a resume during shutdown.
+        await asyncio.gather(*list(self._operations), return_exceptions=True)
         run_ids = list(self._tasks)
         tasks = list(self._tasks.values())
         for task in tasks:

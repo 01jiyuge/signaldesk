@@ -1083,3 +1083,363 @@ async def test_known_durable_ack_survives_pending_send_client_close(protocol_sys
         await asyncio.wait_for(waiter, 1)
     assert calls == ["send", "cancel"]
     assert len(sends) == 1 and sends[0].done() and closed.is_set()
+
+
+@asynccontextmanager
+async def controlled_a2a_remote(repo, jobs, settings, on_send, *, on_get=None, on_cancel=None):
+    def application_for(url):
+        configured = settings.model_copy(update={"a2a_public_url": url + "/a2a/"})
+        server = create_a2a_app(repo, jobs, configured)
+        server.state.bridge.on_message_send = on_send
+        if on_get is not None:
+            server.state.bridge.on_get_task = on_get
+        if on_cancel is not None:
+            server.state.bridge.on_cancel_task = on_cancel
+        app = FastAPI()
+        app.mount("/a2a", server)
+        app.include_router(create_agent_card_router(configured))
+        return app
+
+    async with running_server(None, factory=application_for) as url:
+        yield url
+
+
+@pytest.mark.parametrize("lost_ack", [False, True])
+async def test_concurrent_delegates_send_one_request_and_confirmed_retry_is_local(
+    protocol_system, monkeypatch, lost_ack
+):
+    from a2a.types import Task, TaskState, TaskStatus
+    from a2a.utils.errors import InternalError
+
+    from signaldesk.a2a_store import IdempotencyConflict
+
+    repo, jobs, app, http, project, settings, started = protocol_system
+    accepted, release_ack, second_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    remote_tasks = []
+
+    # This official-SDK remote deliberately does not deduplicate message IDs.
+    # The A2A specification permits that behavior, so the local retry contract
+    # must not depend on SignalDesk's own incoming-message deduplication.
+    async def send_remote(params, context):
+        task = Task(
+            id=f"external-task-{len(remote_tasks) + 1}",
+            context_id="external-project",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        remote_tasks.append(task.id)
+        accepted.set()
+        await release_ack.wait()
+        if lost_ack:
+            raise InternalError("Fixture accepted work without delivering an acknowledgement")
+        return task
+
+    tasks = []
+    try:
+        async with controlled_a2a_remote(repo, jobs, settings, send_remote) as remote_url:
+            configured = settings.model_copy(
+                update={
+                    "a2a_remote_agents": {"external": remote_url + "/a2a/"},
+                    "a2a_remote_tokens": {"external": "fixture-remote-token"},
+                }
+            )
+            first, second = A2ADelegate(configured, repo), A2ADelegate(configured, repo)
+            original_serialize = second.bindings.serialize_send
+
+            @asynccontextmanager
+            async def announce_waiter(message_id):
+                second_entered.set()
+                async with original_serialize(message_id) as gate:
+                    yield gate
+
+            monkeypatch.setattr(second.bindings, "serialize_send", announce_waiter)
+            kwargs = dict(
+                local_project_id=project.id, mode="demo", message_id="same-concurrent-message"
+            )
+            tasks.append(asyncio.create_task(first.send("external", "external-project", **kwargs)))
+            await asyncio.wait_for(accepted.wait(), 1)
+            tasks.append(asyncio.create_task(second.send("external", "external-project", **kwargs)))
+            await asyncio.wait_for(second_entered.wait(), 1)
+            release_ack.set()
+            results = await asyncio.gather(*tasks, return_exceptions=lost_ack)
+            assert len(remote_tasks) == 1
+            if lost_ack:
+                assert all(isinstance(value, PublicTaskError) for value in results)
+                assert {value.code for value in results} == {
+                    "a2a_remote_failed",
+                    "a2a_task_pending",
+                }
+                pending = await first.list(project.id)
+                assert (
+                    len(pending) == 1
+                    and pending[0]["status"] == "PENDING"
+                    and pending[0]["task"] is None
+                )
+            else:
+                assert results[0] == results[1]
+                assert results[0]["task"]["id"] == remote_tasks[0]
+            assert repo._a2a_send_gates == {}
+        if not lost_ack:
+            # The acknowledgement is durable: even with the remote stopped and
+            # a new Delegate instance, retrying returns the same canonical task.
+            replay = await A2ADelegate(configured, repo).send(
+                "external", "external-project", **kwargs
+            )
+            assert replay == results[0]
+            with pytest.raises(IdempotencyConflict):
+                await A2ADelegate(configured, repo).send(
+                    "external", "external-project", **kwargs, demo_revision=2
+                )
+    finally:
+        release_ack.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("finish", ["cancel", "complete"])
+async def test_delayed_http_get_cannot_overwrite_canonical_terminal_task(protocol_system, finish):
+    from a2a.types import Artifact, Part, Task, TaskState, TaskStatus
+
+    repo, jobs, app, http, project, settings, started = protocol_system
+    stale_ready, release_stale = asyncio.Event(), asyncio.Event()
+    current = TaskState.TASK_STATE_WORKING
+    get_calls = 0
+
+    def snapshot():
+        task = Task(
+            id="same-external-task", context_id="external-project", status=TaskStatus(state=current)
+        )
+        if current == TaskState.TASK_STATE_COMPLETED:
+            task.artifacts.append(
+                Artifact(artifact_id="final-report", parts=[Part(text="Finished report evidence")])
+            )
+        return task
+
+    async def send_remote(params, context):
+        return snapshot()
+
+    async def get_remote(params, context):
+        nonlocal get_calls
+        get_calls += 1
+        task = snapshot()
+        if get_calls == 1:
+            stale_ready.set()
+            await release_stale.wait()
+        return task
+
+    async def cancel_remote(params, context):
+        nonlocal current
+        current = TaskState.TASK_STATE_CANCELED
+        return snapshot()
+
+    stale = None
+    try:
+        async with controlled_a2a_remote(
+            repo, jobs, settings, send_remote, on_get=get_remote, on_cancel=cancel_remote
+        ) as remote_url:
+            configured = settings.model_copy(
+                update={
+                    "a2a_remote_agents": {"external": remote_url + "/a2a/"},
+                    "a2a_remote_tokens": {"external": "fixture-remote-token"},
+                }
+            )
+            first, second = A2ADelegate(configured, repo), A2ADelegate(configured, repo)
+            original = await first.send(
+                "external",
+                "external-project",
+                local_project_id=project.id,
+                message_id="terminal-race",
+                mode="demo",
+            )
+            stale = asyncio.create_task(first.get(original["id"]))
+            await asyncio.wait_for(stale_ready.wait(), 1)
+            if finish == "cancel":
+                final = await second.cancel(original["id"])
+                expected = "TASK_STATE_CANCELED"
+            else:
+                current = TaskState.TASK_STATE_COMPLETED
+                final = await second.get(original["id"])
+                expected = "TASK_STATE_COMPLETED"
+            assert final["status"] == expected
+            release_stale.set()
+            delayed = await stale
+            assert delayed == final
+            cached = (await first.list(project.id))[0]
+            assert cached == final
+            if finish == "complete":
+                assert (
+                    cached["task"]["artifacts"][0]["parts"][0]["text"] == "Finished report evidence"
+                )
+    finally:
+        release_stale.set()
+        if stale is not None:
+            await asyncio.gather(stale, return_exceptions=True)
+
+
+@asynccontextmanager
+async def inbound_commit_gate(repo, jobs, settings):
+    from a2a.utils.errors import InternalError
+
+    committed, release = asyncio.Event(), asyncio.Event()
+    requests, committed_runs = [], []
+
+    def make_application(url):
+        configured = settings.model_copy(update={"a2a_public_url": url + "/a2a/"})
+        server = create_a2a_app(repo, jobs, configured)
+        bridge = server.state.bridge
+        original_create, original_send = bridge.bindings.create_or_get, bridge.on_message_send
+
+        async def pause_after_commit(*args, **kwargs):
+            run, created = await original_create(*args, **kwargs)
+            if created:
+                committed_runs.append(run.id)
+                committed.set()
+                await release.wait()
+            return run, created
+
+        async def capture_request(params, context):
+            requests.append(asyncio.current_task())
+            try:
+                return await original_send(params, context)
+            except asyncio.CancelledError:
+                # Simulate a cancelled server request over an actual socket,
+                # while returning a controlled SDK error rather than logging
+                # an expected ASGI cancellation traceback from this fixture.
+                raise InternalError("Controlled disconnected incoming request") from None
+
+        bridge.bindings.create_or_get = pause_after_commit
+        bridge.on_message_send = capture_request
+        app = FastAPI()
+        app.mount("/a2a", server)
+        app.include_router(create_agent_card_router(configured))
+        return app
+
+    try:
+        async with running_server(None, factory=make_application) as url:
+            yield url, committed, release, requests, committed_runs
+    finally:
+        release.set()
+
+
+async def test_inbound_http_cancel_after_commit_keeps_owned_submission_and_retry(protocol_system):
+    repo, jobs, app, http, project, settings, started = protocol_system
+    first = None
+    async with inbound_commit_gate(repo, jobs, settings) as (
+        url,
+        committed,
+        release,
+        requests,
+        committed_runs,
+    ):
+        configured = settings.model_copy(
+            update={
+                "a2a_remote_agents": {"incoming": url + "/a2a/"},
+                "a2a_remote_tokens": {"incoming": "fixture-remote-token"},
+            }
+        )
+        client = A2ADelegate(configured, repo)
+        kwargs = dict(
+            local_project_id=project.id, message_id="cancelled-inbound-create", mode="demo"
+        )
+        try:
+            first = asyncio.create_task(client.send("incoming", project.id, **kwargs))
+            await asyncio.wait_for(committed.wait(), 2)
+            assert len(committed_runs) == 1 and jobs._operations
+            assert (await repo.get_run(committed_runs[0])).status == "queued"
+            requests[0].cancel()
+            release.set()
+            with pytest.raises(PublicTaskError) as caught:
+                await asyncio.wait_for(first, 2)
+            assert caught.value.code == "a2a_remote_failed"
+            await asyncio.wait_for(started.wait(), 2)
+            run_id = committed_runs[0]
+            producer = jobs._tasks[run_id]
+            assert jobs.is_active(run_id) and (await repo.get_run(run_id)).status == "running"
+            retry = await client.send("incoming", project.id, **kwargs)
+            assert retry["task"]["id"] == run_id
+            assert len(await repo.list_runs()) == 1 and jobs._tasks[run_id] is producer
+            assert not jobs._operations and not jobs._run_locks
+        finally:
+            release.set()
+            if first is not None:
+                await asyncio.gather(first, return_exceptions=True)
+
+
+async def test_inbound_http_shutdown_joins_committed_submission_and_refuses_new_requests(
+    protocol_system, monkeypatch
+):
+    repo, jobs, app, http, project, settings, started = protocol_system
+    closing = asyncio.Event()
+    original_shutdown = jobs._shutdown
+
+    async def observe_shutdown():
+        closing.set()
+        await original_shutdown()
+
+    monkeypatch.setattr(jobs, "_shutdown", observe_shutdown)
+    first = shutdown = None
+    async with inbound_commit_gate(repo, jobs, settings) as (
+        url,
+        committed,
+        release,
+        requests,
+        committed_runs,
+    ):
+        async with httpx.AsyncClient(
+            base_url=url,
+            headers={"Authorization": "Bearer fixture-remote-token", "A2A-Version": "1.0"},
+        ) as wire:
+            try:
+                first = asyncio.create_task(
+                    wire.post("/a2a/", json=send_body(project.id, "shutdown-inbound-create"))
+                )
+                await asyncio.wait_for(committed.wait(), 2)
+                shutdown = asyncio.create_task(jobs.shutdown())
+                await asyncio.wait_for(closing.wait(), 2)
+                assert jobs._closing and not shutdown.done() and jobs._operations
+                denied = (
+                    await wire.post("/a2a/", json=send_body(project.id, "after-shutdown-started"))
+                ).json()
+                assert (
+                    denied["error"]["code"] == -32603 and "正在关闭" in denied["error"]["message"]
+                )
+                assert len(await repo.list_runs()) == 1
+                release.set()
+                response, _ = await asyncio.wait_for(asyncio.gather(first, shutdown), 2)
+                assert response.json()["error"]["code"] == -32603
+                failed = await repo.get_run(committed_runs[0])
+                assert failed.status == "failed" and "任务服务正在关闭" in failed.error
+                assert not started.is_set()
+                assert not jobs._operations and not jobs._tasks and not jobs._run_locks
+            finally:
+                release.set()
+                await asyncio.gather(
+                    *(task for task in (first, shutdown) if task is not None),
+                    return_exceptions=True,
+                )
+
+
+async def test_inbound_blocking_poll_does_not_hold_lifecycle_transition_open(protocol_system):
+    repo, jobs, app, http, project, settings, started = protocol_system
+    request = None
+    async with running_server(
+        None,
+        factory=lambda url: application(
+            repo, jobs, settings.model_copy(update={"a2a_public_url": url + "/a2a/"})
+        ),
+    ) as url:
+        async with httpx.AsyncClient(
+            base_url=url,
+            headers={"Authorization": "Bearer fixture-remote-token", "A2A-Version": "1.0"},
+        ) as wire:
+            body = send_body(project.id, "blocking-outside-operation")
+            body["params"]["configuration"]["returnImmediately"] = False
+            try:
+                request = asyncio.create_task(wire.post("/a2a/", json=body))
+                await asyncio.wait_for(started.wait(), 2)
+                assert not request.done() and not jobs._operations and not jobs._run_locks
+                await asyncio.wait_for(jobs.shutdown(), 2)
+                response = (await asyncio.wait_for(request, 2)).json()
+                assert response["result"]["task"]["status"]["state"] == "TASK_STATE_FAILED"
+                assert (await repo.list_runs())[0].status == "interrupted"
+            finally:
+                if request is not None:
+                    await asyncio.gather(request, return_exceptions=True)

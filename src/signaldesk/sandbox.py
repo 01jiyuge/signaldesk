@@ -7,6 +7,7 @@ stdin to a restricted container; it is never evaluated by the application proces
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -16,7 +17,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import JSON, DateTime, String, select
+from sqlalchemy import JSON, DateTime, String, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from signaldesk.config import Settings
@@ -33,6 +34,7 @@ SandboxStatus = Literal[
     "interrupted",
 ]
 ACTIVE_STATUSES = ("queued", "running")
+logger = logging.getLogger(__name__)
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -645,8 +647,30 @@ class SandboxService:
             row = await session.get(SandboxExecution, execution_id)
             return _read(row) if row is not None and row.project_id == project_id else None
 
-    async def _store(self, project_id: str, execution_id: str, result: SandboxResult):
+    async def _store(
+        self,
+        project_id: str,
+        execution_id: str,
+        result: SandboxResult,
+        *,
+        only_active=False,
+    ) -> bool:
         async with self.repo.sessions.begin() as session:
+            if only_active:
+                changed = await session.execute(
+                    update(SandboxExecution)
+                    .where(
+                        SandboxExecution.id == execution_id,
+                        SandboxExecution.project_id == project_id,
+                        SandboxExecution.status.in_(ACTIVE_STATUSES),
+                    )
+                    .values(
+                        status=result.status,
+                        result=result.model_dump(mode="json"),
+                        updated_at=_now(),
+                    )
+                )
+                return changed.rowcount == 1
             row = await session.get(SandboxExecution, execution_id)
             if row is not None and row.project_id == project_id:
                 row.status, row.result, row.updated_at = (
@@ -654,15 +678,23 @@ class SandboxService:
                     result.model_dump(mode="json"),
                     _now(),
                 )
+                return True
+        return False
 
     async def _audit(self, run_id: str | None, kind: str, execution_id: str, **data):
         if run_id:
-            await self.repo.append_event(
-                run_id,
-                kind,
-                "Sandbox 隔离分析执行状态已更新。",
-                {"execution_id": execution_id, **data},
-            )
+            try:
+                await self.repo.append_event(
+                    run_id,
+                    kind,
+                    "Sandbox 隔离分析执行状态已更新。",
+                    {"execution_id": execution_id, **data},
+                )
+            except Exception:
+                # Audit is a separate write after the durable execution result.
+                # Its failure must not erase a completed calculation or leak the
+                # database/provider exception through the API or default logs.
+                logger.warning("Sandbox audit %s could not be saved for %s", kind, execution_id)
 
     async def _run(self, project_id, execution_id, code, input_data, run_id):
         try:
@@ -672,31 +704,34 @@ class SandboxService:
                     row.status, row.updated_at = "running", _now()
                 await self._audit(run_id, "sandbox_started", execution_id)
                 result = await self.executor.execute(code, input_data, execution_id=execution_id)
-                await self._store(project_id, execution_id, result)
-                await self._audit(run_id, "sandbox_finished", execution_id, status=result.status)
+                changed = await self._store(project_id, execution_id, result, only_active=True)
+                if changed:
+                    await self._audit(
+                        run_id, "sandbox_finished", execution_id, status=result.status
+                    )
         except asyncio.CancelledError:
 
             async def store_cancelled():
-                current = await self.get(project_id, execution_id)
-                if current and current.status in ACTIVE_STATUSES:
-                    await self._store(
-                        project_id,
-                        execution_id,
-                        SandboxResult(
-                            execution_id=execution_id,
-                            status="cancelled",
-                            cleanup_confirmed=execution_id not in self.executor._pending_cleanup,
-                            error="执行已取消。",
-                        ),
-                    )
+                changed = await self._store(
+                    project_id,
+                    execution_id,
+                    SandboxResult(
+                        execution_id=execution_id,
+                        status="cancelled",
+                        cleanup_confirmed=execution_id not in self.executor._pending_cleanup,
+                        error="执行已取消。",
+                    ),
+                    only_active=True,
+                )
+                if changed:
+                    await self._audit(run_id, "sandbox_cancelled", execution_id)
 
             await _finish_cleanup(store_cancelled())
-            await _finish_cleanup(self._audit(run_id, "sandbox_cancelled", execution_id))
             raise
         except Exception:
             # Driver/model/daemon messages may contain credentials or local paths.
             # Persist a stable error without exception repr or traceback.
-            await self._store(
+            changed = await self._store(
                 project_id,
                 execution_id,
                 SandboxResult(
@@ -705,8 +740,10 @@ class SandboxService:
                     cleanup_confirmed=execution_id not in self.executor._pending_cleanup,
                     error="Sandbox 执行失败，请检查 Docker 状态后重试。",
                 ),
+                only_active=True,
             )
-            await self._audit(run_id, "sandbox_finished", execution_id, status="failed")
+            if changed:
+                await self._audit(run_id, "sandbox_finished", execution_id, status="failed")
 
     async def cancel(self, project_id: str, execution_id: str) -> SandboxExecutionRead:
         current = await self.get(project_id, execution_id)
@@ -726,7 +763,7 @@ class SandboxService:
             if not confirmed:
                 self.executor._pending_cleanup.add(execution_id)
                 self.executor._cached = None
-            await self._store(
+            changed = await self._store(
                 project_id,
                 execution_id,
                 SandboxResult(
@@ -735,7 +772,10 @@ class SandboxService:
                     cleanup_confirmed=confirmed,
                     error="执行已取消。",
                 ),
+                only_active=True,
             )
+            if changed:
+                await self._audit(current.run_id, "sandbox_cancelled", execution_id)
         return await self.get(project_id, execution_id)
 
     async def execute(
@@ -760,15 +800,45 @@ class SandboxService:
 
     async def shutdown(self):
         self._closing = True
-        # Use scoped cancel so queued tasks cancelled before first execution also
-        # acquire durable terminal records.
-        tasks = list(self._tasks)
-        for execution_id in tasks:
-            async with self.repo.sessions() as session:
-                row = await session.get(SandboxExecution, execution_id)
-                project_id = row.project_id if row else None
-            if project_id:
-                current = await self.get(project_id, execution_id)
-                if current and current.status in ACTIVE_STATUSES:
-                    await self.cancel(project_id, execution_id)
-        await self.executor.shutdown()
+
+        async def finish():
+            # A start already committing its queued row must finish registering
+            # its task before the snapshot. Later starts observe _closing.
+            async with self._start_lock:
+                owned = dict(self._tasks)
+            try:
+                # A terminal database status can precede the producer's final
+                # audit write. Own and join every producer before repo closure.
+                for task in owned.values():
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*owned.values(), return_exceptions=True)
+                for execution_id in owned:
+                    async with self.repo.sessions() as session:
+                        row = await session.get(SandboxExecution, execution_id)
+                        if row is None or row.status not in ACTIVE_STATUSES:
+                            continue
+                        project_id, run_id = row.project_id, row.run_id
+                    # A coroutine cancelled before its first instruction cannot
+                    # enter _run's cancellation handler; persist it here.
+                    confirmed = await self.executor.cleanup(execution_id)
+                    if not confirmed:
+                        self.executor._pending_cleanup.add(execution_id)
+                        self.executor._cached = None
+                    changed = await self._store(
+                        project_id,
+                        execution_id,
+                        SandboxResult(
+                            execution_id=execution_id,
+                            status="cancelled",
+                            cleanup_confirmed=confirmed,
+                            error="执行已取消。",
+                        ),
+                        only_active=True,
+                    )
+                    if changed:
+                        await self._audit(run_id, "sandbox_cancelled", execution_id)
+            finally:
+                await self.executor.shutdown()
+
+        await _finish_cleanup(finish())

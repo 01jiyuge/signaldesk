@@ -312,3 +312,59 @@ async def test_terminal_stream_waits_for_store_and_final_events(setup, monkeypat
         release.set()
         await observer.aclose()
         await jobs.shutdown()
+
+
+async def test_terminal_stream_waits_for_cancellation_audit_after_worker_exits(setup, monkeypatch):
+    from types import SimpleNamespace
+
+    _, repo, _, run = setup
+    started, auditing, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def runner(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    original = repo.append_event
+
+    async def slow_audit(run_id, kind, *args, **kwargs):
+        if kind == "cancelled":
+            auditing.set()
+            await release.wait()
+        return await original(run_id, kind, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "append_event", slow_audit)
+    monkeypatch.setattr("signaldesk.agui.HEARTBEAT_INTERVAL_SECONDS", 0)
+    jobs = JobManager(repo, runner)
+    jobs.submit(run.id)
+    await asyncio.wait_for(started.wait(), 2)
+    cancelling = asyncio.create_task(jobs.cancel(run.id))
+    await asyncio.wait_for(auditing.wait(), 2)
+    assert run.id not in jobs._tasks and jobs.is_active(run.id)
+    request = ConnectedRequest()
+    request.app = SimpleNamespace(state=SimpleNamespace(jobs=jobs))
+    observer = stream_run(repo, await repo.get_run(run.id), request)
+    body = ""
+    try:
+        heartbeats = 0
+        while heartbeats < 4:
+            frame = await asyncio.wait_for(anext(observer), 2)
+            body += frame
+            heartbeats += frame.startswith(": heartbeat")
+            assert '"type":"RUN_FINISHED"' not in frame
+        release.set()
+        await asyncio.wait_for(cancelling, 2)
+
+        async def drain():
+            return "".join([frame async for frame in observer])
+
+        body += await asyncio.wait_for(drain(), 2)
+        frames = parse_sse(body)
+        customs = [event["value"] for _, event in frames if event["type"] == "CUSTOM"]
+        assert customs[-1]["kind"] == "cancelled"
+        assert frames[-1][1]["type"] == "RUN_FINISHED"
+        assert frames[-1][1]["metadata"]["cursor"] == customs[-1]["id"]
+    finally:
+        release.set()
+        await cancelling
+        await observer.aclose()
+        await jobs.shutdown()

@@ -19,6 +19,7 @@ from signaldesk.jobs import JobManager
 from signaldesk.memory import ProjectMemory, open_memory_store
 from signaldesk.memory_api import create_memory_router
 from signaldesk.repository import Repository
+from signaldesk.request_limits import RequestBodyLimitMiddleware
 from signaldesk.retrieval import Retriever
 from signaldesk.sandbox import SandboxService
 from signaldesk.sandbox_api import create_sandbox_router
@@ -44,7 +45,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         nonlocal workflow
-        try:
+        async with AsyncExitStack() as resources:
+            # Register before initialization: a partially opened resource must
+            # also close, and one failing closer must not skip the others.
+            resources.push_async_callback(repo.close)
+            resources.push_async_callback(retriever.close)
+            resources.push_async_callback(sandbox.shutdown)
             await repo.initialize()
             await retriever.initialize()
             await sandbox.initialize()
@@ -68,17 +74,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     delegate=delegate,
                 )
                 app.state.workflow = workflow
+                stack.push_async_callback(jobs.shutdown)
                 await jobs.recover_interrupted()
-                try:
-                    yield
-                finally:
-                    await jobs.shutdown()
-        finally:
-            await sandbox.shutdown()
-            await retriever.close()
-            await repo.close()
+                yield
 
     app = FastAPI(title="SignalDesk", version=__version__, lifespan=lifespan)
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_bytes)
     app.state.repo = repo
     app.state.jobs = jobs
     app.state.retriever = retriever

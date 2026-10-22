@@ -8,6 +8,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -20,3 +21,68 @@ jobs:
       - run: uv run pytest -q
       - run: uv run signaldesk-eval
       - run: node --check src/signaldesk/static/app.js
+
+  integration:
+    name: PostgreSQL and Docker integration
+    needs: test
+    # Only the upstream repository's trusted writes use real service containers.
+    # Fork pull requests still run the complete offline test job above.
+    if: >-
+      github.repository == '01jiyuge/signaldesk' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SIGNALDESK_TEST_DOCKER: "1"
+      SIGNALDESK_TEST_POSTGRES_URL: postgresql://signaldesk_ci:signaldesk-ci-only@127.0.0.1:5432/signaldesk_ci
+      OPENAI_API_KEY: ""
+      LANGSMITH_API_KEY: ""
+      LANGSMITH_TRACING: "false"
+    services:
+      postgres:
+        # Match the PostgreSQL/pgvector image used by compose.yaml.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: signaldesk_ci
+          POSTGRES_USER: signaldesk_ci
+          # Disposable fixture credentials, not a production secret.
+          POSTGRES_PASSWORD: signaldesk-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U signaldesk_ci -d signaldesk_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
+          python-version: "3.13"
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev
+      - name: Prepare the fixed sandbox image
+        timeout-minutes: 5
+        run: |
+          docker info --format '{{.ServerVersion}}'
+          docker pull python:3.14-slim
+          docker image inspect python:3.14-slim --format '{{.Id}}'
+      - name: Verify the isolated PostgreSQL fixture and pgvector
+        run: |
+          uv run python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["SIGNALDESK_TEST_POSTGRES_URL"], autocommit=True) as connection:
+              assert connection.execute("SELECT current_database()").fetchone()[0] == "signaldesk_ci"
+              connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
+              assert connection.execute("SELECT extversion FROM pg_extension WHERE extname='vector'").fetchone()
+          PY
+      - name: Run real PostgreSQL and Docker integration checks
+        timeout-minutes: 10
+        run: uv run pytest -q tests/test_postgres_integration.py tests/test_sandbox_docker.py -rs

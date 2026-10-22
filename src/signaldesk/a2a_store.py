@@ -3,14 +3,34 @@
 import asyncio
 import hashlib
 import json
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from sqlalchemy import JSON, Column, ForeignKey, String, Table, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from signaldesk.db import Base, Event, Run, utcnow
+from signaldesk.errors import PublicTaskError
 from signaldesk.repository import ActiveRunError, Repository, _project, _run
 from signaldesk.schemas import RunCreate, RunRead
+
+TERMINAL_TASK_STATES = frozenset(
+    {
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_REJECTED",
+    }
+)
+
+
+@dataclass
+class _SendGate:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    failed: bool = False
+
 
 requests = Table(
     "a2a_requests",
@@ -44,6 +64,25 @@ class A2ARequestStore:
         self.repo = repo
         self._initialized = False
         self._initialize_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def serialize_send(self, message_id):
+        # Multiple Delegate/Store objects in this process use the same repository.
+        # Retain an entry until its last waiter exits, then remove it so this is
+        # not an unbounded process-wide cache of historical message IDs.
+        if not hasattr(self.repo, "_a2a_send_gates"):
+            self.repo._a2a_send_gates = {}
+        gates = self.repo._a2a_send_gates
+        gate = gates.setdefault(message_id, _SendGate())
+        waiting = gate.lock.locked()
+        gate.users += 1
+        try:
+            async with gate.lock:
+                yield gate, waiting
+        finally:
+            gate.users -= 1
+            if not gate.users and gates.get(message_id) is gate:
+                gates.pop(message_id)
 
     async def initialize(self) -> None:
         async with self._initialize_lock:
@@ -267,9 +306,36 @@ class A2ARequestStore:
             )
             return [dict(row) for row in rows]
 
-    async def record_task(self, delegation_id, task: dict) -> None:
-        async with self.repo.engine.begin() as connection:
-            await connection.execute(
+    async def record_task(self, delegation_id, task: dict) -> dict:
+        existing = await self.get_delegation(delegation_id)
+        if existing is None:
+            raise KeyError(delegation_id)
+        # Serialize read/check/write in Python AND the database, including other
+        # Store/Repository instances. Checking a prior SELECT outside this lock
+        # would still allow a delayed response to overwrite a terminal commit.
+        async with self.repo._locked_project_session(existing["project_id"]) as (session, _):
+            current = dict(
+                (
+                    await session.execute(
+                        select(delegations).where(delegations.c.id == delegation_id)
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            incoming_id = task.get("id")
+            if not incoming_id or (
+                current["task"] is not None and current["task"]["id"] != incoming_id
+            ):
+                raise PublicTaskError(
+                    "远端任务 ID 与已登记委托不一致，已拒绝替换。",
+                    code="a2a_task_mismatch",
+                    suggestion="核对远端任务与实例状态；需要新研究时请创建新的委托。",
+                )
+            if current["status"] in TERMINAL_TASK_STATES:
+                return current
+            accepted = {**current, "task": task, "status": task["status"]["state"]}
+            await session.execute(
                 update(delegations)
                 .where(delegations.c.id == delegation_id)
                 .values(
@@ -277,3 +343,4 @@ class A2ARequestStore:
                     status=task["status"]["state"],
                 )
             )
+            return accepted

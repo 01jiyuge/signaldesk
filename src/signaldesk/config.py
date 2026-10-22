@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     memory_url: str = "sqlite:///./data/memory.db"
     memory_max_items: int = Field(default=50, ge=1, le=500)
     api_token: str = ""
+    max_request_bytes: int = Field(default=1_048_576, ge=1024, le=10 * 1024 * 1024)
     research_mode: str = "demo"
     model: str = ""
     openai_api_key: str = ""

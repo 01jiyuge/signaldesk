@@ -22,7 +22,7 @@ from google.protobuf.struct_pb2 import Value
 from pydantic import BaseModel, ConfigDict, Field
 
 from signaldesk.a2a_server import A2ACommand, authenticate_a2a, validate_endpoint
-from signaldesk.a2a_store import A2ARequestStore, IdempotencyConflict
+from signaldesk.a2a_store import TERMINAL_TASK_STATES, A2ARequestStore, IdempotencyConflict
 from signaldesk.errors import PublicTaskError
 
 MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -213,6 +213,36 @@ class A2ADelegate:
         message_id: str,
         _acknowledged: asyncio.Future | None = None,
     ) -> dict:
+        if not isinstance(message_id, str) or not 1 <= len(message_id) <= 128:
+            raise PublicTaskError("message_id 须为 1–128 字符。", code="a2a_invalid_message_id")
+        async with self.bindings.serialize_send(message_id) as (gate, waiting):
+            return await self._send_locked(
+                remote,
+                remote_project_id,
+                local_project_id=local_project_id,
+                local_run_id=local_run_id,
+                mode=mode,
+                demo_revision=demo_revision,
+                message_id=message_id,
+                _acknowledged=_acknowledged,
+                _send_gate=gate,
+                _waited=waiting,
+            )
+
+    async def _send_locked(
+        self,
+        remote: str,
+        remote_project_id: str,
+        *,
+        local_project_id: str,
+        local_run_id: str | None,
+        mode,
+        demo_revision,
+        message_id: str,
+        _acknowledged: asyncio.Future | None,
+        _send_gate,
+        _waited: bool,
+    ) -> dict:
         command = A2ACommand(project_id=remote_project_id, mode=mode, demo_revision=demo_revision)
         command.run_payload()
         if not 1 <= len(message_id) <= 128:
@@ -230,6 +260,18 @@ class A2ADelegate:
             demo_revision=demo_revision,
             message_id=message_id,
         )
+        if record["task"] is not None:
+            result = self._public(record)
+            if _acknowledged is not None and not _acknowledged.done():
+                _acknowledged.set_result(result)
+            return result
+        if _waited and _send_gate.failed:
+            raise PublicTaskError(
+                "相同消息的并发发送尚未确认远端任务，请核对 PENDING 登记后显式重试。",
+                code="a2a_task_pending",
+                retryable=True,
+                suggestion="远端可能已接受任务；缺失 ACK 时无法保证外部恰好执行一次。",
+            )
         request = SendMessageRequest(
             message=Message(
                 message_id=message_id,
@@ -243,18 +285,22 @@ class A2ADelegate:
             ),
             configuration=SendMessageConfiguration(return_immediately=True),
         )
-        async with self._client(remote) as client:
-            async for response in client.send_message(request):
-                if not response.HasField("task"):
-                    raise ValueError("Remote response did not contain a task")
-                self._check_project(response.task, remote_project_id)
-                task = MessageToDict(response.task)
-                await self.bindings.record_task(record["id"], task)
-                result = self._public({**record, "task": task, "status": task["status"]["state"]})
-                if _acknowledged is not None and not _acknowledged.done():
-                    _acknowledged.set_result(result)
-                return result
-            raise ValueError("Remote did not return a task")
+        try:
+            async with self._client(remote) as client:
+                async for response in client.send_message(request):
+                    if not response.HasField("task"):
+                        raise ValueError("Remote response did not contain a task")
+                    self._check_project(response.task, remote_project_id)
+                    task = MessageToDict(response.task)
+                    accepted = await self.bindings.record_task(record["id"], task)
+                    result = self._public(accepted)
+                    if _acknowledged is not None and not _acknowledged.done():
+                        _acknowledged.set_result(result)
+                    return result
+                raise ValueError("Remote did not return a task")
+        except BaseException:
+            _send_gate.failed = True
+            raise
 
     async def get(self, delegation_id: str) -> dict:
         record = await self._registered(delegation_id)
@@ -262,8 +308,8 @@ class A2ADelegate:
             task = await client.get_task(GetTaskRequest(id=record["task"]["id"]))
             self._check_project(task, record["remote_project_id"])
             data = MessageToDict(task)
-            await self.bindings.record_task(record["id"], data)
-            return self._public({**record, "task": data, "status": data["status"]["state"]})
+            accepted = await self.bindings.record_task(record["id"], data)
+            return self._public(accepted)
 
     async def list(self, project_id: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
         return [
@@ -279,19 +325,22 @@ class A2ADelegate:
         async with self._client(record["remote"]) as client:
             current = await client.get_task(GetTaskRequest(id=task_id))
             self._check_project(current, record["remote_project_id"])
-            state = MessageToDict(current)["status"]["state"]
+            accepted = await self.bindings.record_task(record["id"], MessageToDict(current))
+            state = accepted["status"]
             if state == "TASK_STATE_CANCELED":
-                data = MessageToDict(current)
-                await self.bindings.record_task(record["id"], data)
-                return self._public({**record, "task": data, "status": state})
-            if state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED"}:
-                await self.bindings.record_task(record["id"], MessageToDict(current))
+                return self._public(accepted)
+            if state in TERMINAL_TASK_STATES:
                 raise TaskNotCancelableError()
             task = await client.cancel_task(CancelTaskRequest(id=task_id))
             self._check_project(task, record["remote_project_id"])
             data = MessageToDict(task)
-            await self.bindings.record_task(record["id"], data)
-            return self._public({**record, "task": data, "status": data["status"]["state"]})
+            accepted = await self.bindings.record_task(record["id"], data)
+            if (
+                accepted["status"] in TERMINAL_TASK_STATES
+                and accepted["status"] != "TASK_STATE_CANCELED"
+            ):
+                raise TaskNotCancelableError()
+            return self._public(accepted)
 
     async def delegate_wait(
         self,

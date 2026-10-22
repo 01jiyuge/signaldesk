@@ -1,6 +1,5 @@
 """HTTP routes. Progress is exposed as cursor-based JSON event polling."""
 
-import asyncio
 import secrets
 from typing import Annotated, Literal
 
@@ -19,7 +18,6 @@ from signaldesk.schemas import EventRead, ProjectCreate, ProjectRead, RunCreate,
 def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/api")
     bearer = HTTPBearer(auto_error=False)
-    resume_locks: dict[str, asyncio.Lock] = {}
 
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
@@ -82,6 +80,7 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
         return {
             "version": __version__,
             "orchestration": "langgraph",
+            "http": {"max_request_bytes": settings.max_request_bytes},
             "research": {
                 "harness": "deepagents",
                 "framework": "langchain",
@@ -153,16 +152,25 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
                 settings.validate_live()
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        async def create():
+            try:
+                run = await repo.create_run(project_id, payload)
+            except ActiveRunError as exc:
+                raise HTTPException(
+                    status_code=409, detail="这个项目已有等待或执行中的任务。"
+                ) from exc
+            try:
+                jobs.submit(run.id)
+            except (RuntimeError, ValueError) as exc:
+                await repo.update_run(run.id, status="failed", error="任务服务正在关闭，请重试。")
+                raise HTTPException(status_code=409, detail="任务服务正在关闭，请重试。") from exc
+            return run
+
         try:
-            run = await repo.create_run(project_id, payload)
-        except ActiveRunError as exc:
-            raise HTTPException(status_code=409, detail="这个项目已有等待或执行中的任务。") from exc
-        try:
-            jobs.submit(run.id)
-        except (RuntimeError, ValueError) as exc:
-            await repo.update_run(run.id, status="failed", error=str(exc))
-            raise HTTPException(status_code=409, detail="任务服务正在关闭，请重试。") from exc
-        return run
+            return await jobs.transition(f"project:{project_id}", create)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail="任务服务正在关闭，请稍后重试。") from exc
 
     @protected.get("/runs", response_model=list[RunRead])
     async def list_runs(project_id: str | None = None):
@@ -200,8 +208,7 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
         "/runs/{run_id}/resume", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED
     )
     async def resume_run(run_id: str):
-        lock = resume_locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
+        async def resume():
             run = await require_run(run_id)
             if run.status not in ("interrupted", "failed", "cancelled"):
                 raise HTTPException(status_code=409, detail="仅中断、失败或取消的任务可以恢复。")
@@ -226,12 +233,17 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
             await repo.append_event(run_id, "resumed", "任务已加入恢复队列。")
             return updated
 
+        try:
+            return await jobs.transition(run_id, resume)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail="任务服务正在关闭，请稍后重试。") from exc
+
     @protected.post("/runs/{run_id}/cancel", response_model=RunRead)
     async def cancel_run(run_id: str):
         await require_run(run_id)
         try:
             await jobs.cancel(run_id)
-        except ValueError as exc:
+        except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail="仅等待或执行中的任务可以取消。") from exc
         return await require_run(run_id)
 

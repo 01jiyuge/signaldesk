@@ -204,23 +204,37 @@ class SignalDeskA2AHandler(RequestHandler):
                 raise ValueError("context_id 必须等于 project_id。")
             if payload.mode == "live":
                 self.settings.validate_live()
-            run, created = await self.bindings.create_or_get(
-                command.project_id, payload, message.message_id
-            )
+
+            async def create_and_submit():
+                run, created = await self.bindings.create_or_get(
+                    command.project_id, payload, message.message_id
+                )
+                if created:
+                    try:
+                        self.jobs.submit(run.id)
+                    except (RuntimeError, ValueError) as exc:
+                        await self.repo.update_run(
+                            run.id,
+                            status="failed",
+                            error="任务服务正在关闭，请使用新的 message_id 重试。",
+                        )
+                        raise InternalError("任务服务暂不可用。") from exc
+                return run
+
+            # The owned operation spans commit, submission, and a failed-submit
+            # write. A disconnected HTTP request cannot strand a committed run
+            # outside the worker registry; shutdown waits for this operation.
+            run = await self.jobs.transition(f"project:{command.project_id}", create_and_submit)
         except (ValueError, IdempotencyConflict) as exc:
             raise InvalidParamsError("项目研究参数、模型配置或 message_id 幂等绑定无效。") from exc
         except KeyError as exc:
             raise TaskNotFoundError("项目不存在。") from exc
         except ActiveRunError as exc:
             raise InvalidParamsError("项目已有其他等待或执行中的任务。") from exc
-        if created:
-            try:
-                self.jobs.submit(run.id)
-            except (RuntimeError, ValueError) as exc:
-                await self.repo.update_run(
-                    run.id, status="failed", error="任务服务正在关闭，请使用新的 message_id 重试。"
-                )
-                raise InternalError("任务服务暂不可用。") from exc
+        except RuntimeError as exc:
+            raise InternalError("任务服务正在关闭，暂不接受新任务。") from exc
+        # Blocking result polling does not own a lifecycle transition. Holding
+        # the project operation open here would make shutdown wait for research.
         if not params.configuration.return_immediately:
             deadline = asyncio.get_running_loop().time() + getattr(
                 self.settings, "a2a_timeout_seconds", 180

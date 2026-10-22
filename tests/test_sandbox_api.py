@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
@@ -203,3 +204,125 @@ async def test_unavailable_is_503_and_does_not_create_execution(api):
     assert response.status_code == 503
     assert "SECRET" not in response.text
     assert await service.list(project.id) == []
+
+
+async def test_audit_failure_keeps_successful_result_and_hides_raw_error(api, monkeypatch, caplog):
+    _, repo, service, _, project, _, _ = api
+    run = await repo.create_run(project.id, RunCreate())
+    original = repo.append_event
+
+    async def broken_finished(run_id, kind, message, data=None):
+        if kind == "sandbox_finished":
+            raise RuntimeError("fixture-sensitive-database-detail")
+        return await original(run_id, kind, message, data)
+
+    monkeypatch.setattr(repo, "append_event", broken_finished)
+    result = await service.execute(project.id, "result=42", run_id=run.id)
+    assert result.status == "completed" and result.result == {"answer": 42}
+    stored = await service.get(project.id, result.execution_id)
+    assert stored.status == "completed" and stored.result == result
+    assert "fixture-sensitive-database-detail" not in caplog.text
+    assert "could not be saved" in caplog.text
+
+
+async def test_shutdown_joins_terminal_producer_and_does_not_audit_it_as_cancelled(
+    api, monkeypatch
+):
+    _, repo, service, _, project, _, _ = api
+    run = await repo.create_run(project.id, RunCreate())
+    reached, stopped = asyncio.Event(), asyncio.Event()
+    original = repo.append_event
+
+    async def blocked_finished(run_id, kind, message, data=None):
+        if kind == "sandbox_finished":
+            reached.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        return await original(run_id, kind, message, data)
+
+    monkeypatch.setattr(repo, "append_event", blocked_finished)
+    row = await service.start(project.id, "result=42", run_id=run.id)
+    await asyncio.wait_for(reached.wait(), 1)
+    producer = service._tasks[row.id]
+    assert (await service.get(project.id, row.id)).status == "completed"
+    await asyncio.wait_for(service.shutdown(), 1)
+    assert stopped.is_set() and producer.done()
+    assert not service._tasks
+    assert (await service.get(project.id, row.id)).result.result == {"answer": 42}
+    assert "sandbox_cancelled" not in [event.kind for event in await repo.list_events(run.id)]
+
+
+async def test_actual_cancellation_audits_transition_once_even_during_shutdown(api):
+    _, repo, service, cli, project, _, _ = api
+    run = await repo.create_run(project.id, RunCreate())
+    cli.hold = True
+    row = await service.start(project.id, "result=42", run_id=run.id)
+    await asyncio.wait_for(cli.started.wait(), 1)
+    await service.shutdown()
+    assert (await service.get(project.id, row.id)).status == "cancelled"
+    events = [event.kind for event in await repo.list_events(run.id)]
+    assert events.count("sandbox_cancelled") == 1
+    assert "sandbox_finished" not in events
+
+
+async def test_repeated_shutdown_cancellation_still_joins_and_persists(api, monkeypatch):
+    _, repo, service, cli, project, _, _ = api
+    run = await repo.create_run(project.id, RunCreate())
+    cli.hold = True
+    row = await service.start(project.id, "result=42", run_id=run.id)
+    await asyncio.wait_for(cli.started.wait(), 1)
+    auditing, release = asyncio.Event(), asyncio.Event()
+    original = repo.append_event
+
+    async def blocked_cancelled(run_id, kind, message, data=None):
+        if kind == "sandbox_cancelled":
+            auditing.set()
+            await release.wait()
+        return await original(run_id, kind, message, data)
+
+    monkeypatch.setattr(repo, "append_event", blocked_cancelled)
+    closing = asyncio.create_task(service.shutdown())
+    await asyncio.wait_for(auditing.wait(), 1)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release.set()
+    await asyncio.gather(closing, return_exceptions=True)
+    assert closing.cancelled()
+    assert not service._tasks and cli.active == 0
+    assert (await service.get(project.id, row.id)).status == "cancelled"
+    events = [event.kind for event in await repo.list_events(run.id)]
+    assert events.count("sandbox_cancelled") == 1
+
+
+async def test_shutdown_owns_start_that_is_still_committing_its_queue_row(api, monkeypatch):
+    _, repo, service, cli, project, _, _ = api
+    cli.hold = True
+    committing, release = asyncio.Event(), asyncio.Event()
+    original_begin = repo.sessions.begin
+
+    @asynccontextmanager
+    async def gated_begin():
+        async with original_begin() as session:
+            yield session
+            if asyncio.current_task().get_name() == "start-during-shutdown":
+                committing.set()
+                await release.wait()
+
+    monkeypatch.setattr(repo.sessions, "begin", gated_begin)
+    starting = asyncio.create_task(
+        service.start(project.id, "result=42"), name="start-during-shutdown"
+    )
+    await asyncio.wait_for(committing.wait(), 1)
+    closing = asyncio.create_task(service.shutdown())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    release.set()
+    row = await starting
+    await asyncio.wait_for(closing, 1)
+    assert not service._tasks and cli.active == 0
+    assert (await service.get(project.id, row.id)).status == "cancelled"
