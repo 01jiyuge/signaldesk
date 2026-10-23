@@ -1,6 +1,7 @@
 """Bounded public-page collection. Demo fixtures never use the network."""
 
 import asyncio
+import codecs
 import hashlib
 import ipaddress
 import socket
@@ -12,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from signaldesk.config import Settings
 from signaldesk.errors import PublicTaskError
+from signaldesk.http_limits import ResponseBodyError, read_bounded_body
 
 
 class CollectionError(PublicTaskError):
@@ -67,8 +69,13 @@ async def validate_public_url(url: str) -> None:
             )
 
 
-def extract_text(html: str, max_chars: int) -> tuple[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
+def extract_text(
+    html: str | bytes, max_chars: int, *, encoding: str | None = None
+) -> tuple[str, str]:
+    # Keep bytes intact until the HTML parser can inspect its BOM and meta tags.
+    soup = BeautifulSoup(
+        html, "html.parser", from_encoding=encoding if isinstance(html, bytes) else None
+    )
     title = soup.title.get_text(" ", strip=True) if soup.title else "Untitled source"
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg"]):
         tag.decompose()
@@ -77,6 +84,35 @@ def extract_text(html: str, max_chars: int) -> tuple[str, str]:
     if not text:
         raise CollectionError("来源未包含可读取的正文；动态页面需后续浏览器采集器。")
     return title[:300], text
+
+
+def _http_charset(response: httpx.Response) -> str | None:
+    declared = response.charset_encoding
+    if declared is None:
+        return None
+    try:
+        codec = codecs.lookup(declared)
+        if not codec._is_text_encoding:
+            raise LookupError("not a text encoding")
+        codec.decode(b"", "replace")
+    except (LookupError, ValueError) as exc:
+        raise CollectionError(
+            "来源声明了无效或不支持的文本字符编码。", code="source_invalid_charset", retryable=False
+        ) from exc
+    return codec.name
+
+
+def _body_error(exc: ResponseBodyError) -> CollectionError:
+    messages = {
+        "response_too_large": ("来源超过单页大小限制。", "source_too_large"),
+        "unsupported_content_encoding": (
+            "来源未遵守未压缩响应请求；目前不支持压缩来源。",
+            "source_unsupported_content_encoding",
+        ),
+        "invalid_content_length": ("来源声明了无效的正文长度。", "source_invalid_content_length"),
+    }
+    message, code = messages[exc.code]
+    return CollectionError(message, code=code, retryable=False)
 
 
 async def fetch_page(
@@ -95,43 +131,60 @@ async def fetch_page(
             headers={"User-Agent": "SignalDesk/0.1 (competitive-intelligence research)"},
         )
     try:
-        for _ in range(5):
-            await validator(url)
-            async with client.stream("GET", url) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise CollectionError("来源重定向缺少目标地址。")
-                    url = urljoin(url, location)
-                    continue
-                if response.status_code != 200:
-                    raise CollectionError(
-                        f"来源返回 HTTP {response.status_code}。",
-                        code="source_http_error",
-                        retryable=response.status_code in {408, 429} or response.status_code >= 500,
-                    )
-                media_type = response.headers.get("content-type", "").split(";")[0].strip()
-                if media_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
-                    raise CollectionError(
-                        "目前仅支持 HTML 或纯文本来源。", code="unsupported_source", retryable=False
-                    )
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > settings.max_source_bytes:
+        # HTTPX's per-operation timeouts do not bound a slow drip, validation or
+        # multiple redirects. One deadline covers the complete collection flow.
+        async with asyncio.timeout(settings.request_timeout_seconds):
+            for _ in range(5):
+                await validator(url)
+                async with client.stream(
+                    "GET", url, headers={"Accept-Encoding": "identity"}, follow_redirects=False
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise CollectionError("来源重定向缺少目标地址。")
+                        url = urljoin(url, location)
+                        continue
+                    if response.status_code != 200:
                         raise CollectionError(
-                            "来源超过单页大小限制。", code="source_too_large", retryable=False
+                            f"来源返回 HTTP {response.status_code}。",
+                            code="source_http_error",
+                            retryable=response.status_code in {408, 429}
+                            or response.status_code >= 500,
                         )
-                text = data.decode(response.encoding or "utf-8", errors="replace")
-                if media_type == "text/plain":
-                    value = text.strip()[: settings.max_source_chars]
-                    if not value:
-                        raise CollectionError("来源正文为空。")
-                    return urlsplit(url).hostname or "Source", value
-                return extract_text(text, settings.max_source_chars)
-        raise CollectionError("来源重定向次数超过限制。")
+                    media_type = (
+                        response.headers.get("content-type", "").split(";")[0].strip().lower()
+                    )
+                    if media_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
+                        raise CollectionError(
+                            "目前仅支持 HTML 或纯文本来源。",
+                            code="unsupported_source",
+                            retryable=False,
+                        )
+                    charset = _http_charset(response)
+                    try:
+                        data = await read_bounded_body(response, settings.max_source_bytes)
+                    except ResponseBodyError as exc:
+                        raise _body_error(exc) from exc
+                    if media_type == "text/plain":
+                        try:
+                            value = data.decode(charset or "utf-8-sig", errors="replace").strip()
+                        except (LookupError, UnicodeError) as exc:
+                            raise CollectionError(
+                                "来源文本字符编码无法解码。",
+                                code="source_invalid_charset",
+                                retryable=False,
+                            ) from exc
+                        value = value[: settings.max_source_chars]
+                        if not value:
+                            raise CollectionError("来源正文为空。")
+                        return urlsplit(url).hostname or "Source", value
+                    return extract_text(data, settings.max_source_chars, encoding=charset)
+            raise CollectionError("来源重定向次数超过限制。")
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise CollectionError("来源采集超过时间限制，请稍后重试。", code="source_timeout") from exc
     except httpx.HTTPError as exc:
-        raise CollectionError("来源访问失败或超时，请稍后重试。") from exc
+        raise CollectionError("来源访问失败，请稍后重试。", code="source_access_failed") from exc
     finally:
         if owns_client:
             await client.aclose()

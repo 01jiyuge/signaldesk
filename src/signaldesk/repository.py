@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import event, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -419,33 +419,39 @@ class Repository:
     async def search_snapshots(
         self, project_id: str, query: str, limit: int = 5
     ) -> list[SnapshotRecord]:
-        """Portable lexical baseline; the pgvector backend can replace this later."""
+        """Score each source's latest successful revision with a portable baseline."""
         terms = set(re.findall(r"[\w]+", query.casefold()))
         if not terms:
             return []
+        latest = (
+            select(
+                Snapshot.id,
+                func.row_number()
+                .over(
+                    partition_by=Snapshot.url,
+                    order_by=(Snapshot.created_at.desc(), Snapshot.id.desc()),
+                )
+                .label("revision"),
+            )
+            .join(Run, Snapshot.run_id == Run.id)
+            .where(Snapshot.project_id == project_id, Run.status == "completed")
+            .subquery()
+        )
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
                     select(Snapshot)
-                    .join(Run, Snapshot.run_id == Run.id)
-                    .where(
-                        Snapshot.project_id == project_id,
-                        Run.status == "completed",
-                    )
+                    .join(latest, Snapshot.id == latest.c.id)
+                    .where(latest.c.revision == 1)
                     .order_by(Snapshot.created_at.desc(), Snapshot.id.desc())
                     .limit(1000)
                 )
             ).all()
         scored = []
-        seen: set[str] = set()
         for row in rows:
-            # Keep the latest revision of a source in retrieval results.
-            if row.url in seen:
-                continue
-            seen.add(row.url)
             haystack = f"{row.title}\n{row.text}".casefold()
             score = sum(haystack.count(term) for term in terms)
             if score:
                 scored.append((score, row))
-        scored.sort(key=lambda item: item[0], reverse=True)
+        scored.sort(key=lambda item: (item[0], item[1].created_at, item[1].id), reverse=True)
         return [_snapshot(row) for _, row in scored[: max(1, min(limit, 50))]]

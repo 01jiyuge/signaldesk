@@ -1,6 +1,8 @@
 """Scoped lexical + full-text + pgvector recall, RRF fusion, then reranking."""
 
+import asyncio
 import json
+import math
 import re
 from datetime import UTC, datetime
 
@@ -9,6 +11,7 @@ from langchain_openai import OpenAIEmbeddings
 from sqlalchemy import text
 
 from signaldesk.config import Settings
+from signaldesk.errors import PublicTaskError
 from signaldesk.repository import Repository
 from signaldesk.reranking import Reranker
 from signaldesk.schemas import SearchHit, SnapshotRecord
@@ -26,6 +29,20 @@ def _snapshot(row) -> SnapshotRecord:
         value = value.replace(tzinfo=UTC) if value.tzinfo is None else value
         data["created_at"] = value.isoformat()
     return SnapshotRecord.model_validate(data)
+
+
+def _validate_vector(vector, dimensions: int) -> None:
+    if (
+        not isinstance(vector, (list, tuple))
+        or len(vector) != dimensions
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in vector
+        )
+    ):
+        raise ValueError("Invalid embedding response")
 
 
 class Retriever:
@@ -108,9 +125,22 @@ class Retriever:
     async def index_snapshots(self, snapshots: list[SnapshotRecord]) -> None:
         if self.embeddings is None or not snapshots:
             return
-        vectors = await self.embeddings.aembed_documents(
-            [f"{s.title}\n{s.text[:12000]}" for s in snapshots]
-        )
+        try:
+            async with asyncio.timeout(self.settings.request_timeout_seconds):
+                vectors = await self.embeddings.aembed_documents(
+                    [f"{s.title}\n{s.text[:12000]}" for s in snapshots]
+                )
+                if not isinstance(vectors, (list, tuple)) or len(vectors) != len(snapshots):
+                    raise ValueError("Incomplete embedding response")
+                for vector in vectors:
+                    _validate_vector(vector, self.settings.embedding_dimensions)
+        except Exception as exc:
+            raise PublicTaskError(
+                "证据嵌入服务调用失败或返回了无效结果。",
+                code="embedding_index_failed",
+                retryable=True,
+                suggestion="检查嵌入服务、模型维度和凭据后恢复任务。",
+            ) from exc
         async with self.repo.engine.begin() as conn:
             for snapshot, vector in zip(snapshots, vectors, strict=True):
                 await conn.execute(
@@ -137,13 +167,13 @@ class Retriever:
             sql = f"""WITH latest AS ({LATEST}) SELECT l.* FROM latest l
                 JOIN snapshot_fts ON snapshot_fts.snapshot_id=l.id
                 WHERE l.rn=1 AND snapshot_fts MATCH :query
-                ORDER BY bm25(snapshot_fts), l.created_at DESC LIMIT :limit"""
+                ORDER BY bm25(snapshot_fts), l.created_at DESC, l.id DESC LIMIT :limit"""
         else:
             sql = f"""WITH latest AS ({LATEST}) SELECT l.* FROM latest l
                 WHERE l.rn=1 AND to_tsvector('simple',coalesce(l.title,'') || ' ' || coalesce(l.text,''))
                 @@ websearch_to_tsquery('simple',:query)
                 ORDER BY ts_rank_cd(to_tsvector('simple',coalesce(l.title,'') || ' ' || coalesce(l.text,'')),
-                websearch_to_tsquery('simple',:query)) DESC,l.created_at DESC LIMIT :limit"""
+                websearch_to_tsquery('simple',:query)) DESC,l.created_at DESC,l.id DESC LIMIT :limit"""
         async with self.repo.engine.connect() as conn:
             rows = (
                 (
@@ -169,15 +199,26 @@ class Retriever:
             )
         if not count:
             return []
-        vector = await self.embeddings.aembed_query(query)
+        try:
+            async with asyncio.timeout(self.settings.request_timeout_seconds):
+                vector = await self.embeddings.aembed_query(query)
+                _validate_vector(vector, self.settings.embedding_dimensions)
+        except Exception as exc:
+            raise PublicTaskError(
+                "查询嵌入服务调用失败或返回了无效结果。",
+                code="embedding_query_failed",
+                retryable=True,
+                suggestion="检查嵌入服务、模型维度和凭据后重试检索。",
+            ) from exc
         # Reuse an older embedding only when its content hash still matches the
         # latest successful snapshot. Never return superseded source contents.
         sql = f"""WITH latest AS ({LATEST}) SELECT l.* FROM latest l
             JOIN LATERAL (SELECT e.embedding FROM evidence_embeddings e
                 JOIN snapshots old ON old.id=e.snapshot_id JOIN runs r ON r.id=old.run_id
                 WHERE e.project_id=l.project_id AND old.url=l.url AND old.content_hash=l.content_hash
-                AND r.status='completed' ORDER BY old.created_at DESC LIMIT 1) v ON true
-            WHERE l.rn=1 ORDER BY v.embedding <=> CAST(:embedding AS vector) LIMIT :limit"""
+                AND r.status='completed' ORDER BY old.created_at DESC, old.id DESC LIMIT 1) v ON true
+            WHERE l.rn=1 ORDER BY v.embedding <=> CAST(:embedding AS vector),
+            l.created_at DESC, l.id DESC LIMIT :limit"""
         async with self.repo.engine.connect() as conn:
             rows = (
                 (
@@ -207,7 +248,7 @@ class Retriever:
                 methods.setdefault(item.id, []).append(method)
         strategy = "hybrid_rrf" if len(recalls) > 1 else "lexical"
         hits = []
-        for item_id in sorted(scores, key=lambda key: scores[key], reverse=True)[:count]:
+        for item_id in sorted(scores, key=lambda key: (scores[key], key), reverse=True)[:count]:
             item = candidates[item_id]
             hits.append(
                 SearchHit(

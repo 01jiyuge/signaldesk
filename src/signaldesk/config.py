@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     reranker_api_key: str = ""
     reranker_model: str = ""
     reranker_timeout_seconds: float = Field(default=20, ge=1, le=120)
+    reranker_max_response_bytes: int = Field(default=1_048_576, ge=1024, le=5_242_880)
     max_concurrent_runs: int = Field(default=2, ge=1, le=8)
     max_sources: int = Field(default=8, ge=1, le=20)
     max_source_bytes: int = Field(default=1_000_000, ge=1000, le=5_000_000)

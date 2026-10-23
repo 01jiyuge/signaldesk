@@ -1,5 +1,7 @@
 """Explicit lexical baseline and Cohere-compatible neural reranking."""
 
+import asyncio
+import json
 import math
 import re
 
@@ -7,6 +9,7 @@ import httpx
 
 from signaldesk.config import Settings
 from signaldesk.errors import PublicTaskError
+from signaldesk.http_limits import read_bounded_body
 from signaldesk.schemas import SearchHit
 
 
@@ -42,7 +45,9 @@ class Reranker:
                     )
                 )
             return sorted(
-                scored, key=lambda hit: (hit.score, hit.retrieval_score or 0), reverse=True
+                scored,
+                key=lambda hit: (hit.score, hit.retrieval_score or 0, hit.evidence_id),
+                reverse=True,
             )[:limit]
         if not self.settings.reranker_url or not self.settings.reranker_model:
             raise PublicTaskError(
@@ -54,24 +59,28 @@ class Reranker:
             self.client = httpx.AsyncClient(
                 timeout=self.settings.reranker_timeout_seconds, follow_redirects=False
             )
-        headers = (
-            {"Authorization": f"Bearer {self.settings.reranker_api_key}"}
-            if self.settings.reranker_api_key
-            else {}
-        )
+        headers = {"Accept-Encoding": "identity"}
+        if self.settings.reranker_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.reranker_api_key}"
         try:
-            response = await self.client.post(
-                self.settings.reranker_url,
-                headers=headers,
-                json={
-                    "model": self.settings.reranker_model,
-                    "query": query,
-                    "documents": [f"{hit.title}\n{hit.text}" for hit in hits],
-                    "top_n": min(limit, len(hits)),
-                },
-            )
-            response.raise_for_status()
-            results = response.json()["results"]
+            async with asyncio.timeout(self.settings.reranker_timeout_seconds):
+                async with self.client.stream(
+                    "POST",
+                    self.settings.reranker_url,
+                    follow_redirects=False,
+                    headers=headers,
+                    json={
+                        "model": self.settings.reranker_model,
+                        "query": query,
+                        "documents": [f"{hit.title}\n{hit.text}" for hit in hits],
+                        "top_n": min(limit, len(hits)),
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    body = await read_bounded_body(
+                        response, self.settings.reranker_max_response_bytes
+                    )
+            results = json.loads(body)["results"]
             if not isinstance(results, list) or len(results) != min(limit, len(hits)):
                 raise ValueError("Incomplete reranker response")
             seen, ranked = set(), []
@@ -100,8 +109,17 @@ class Reranker:
                         }
                     )
                 )
-            return sorted(ranked, key=lambda hit: hit.score, reverse=True)
-        except (httpx.HTTPError, ValueError, KeyError, TypeError, OverflowError) as exc:
+            return sorted(ranked, key=lambda hit: (hit.score, hit.evidence_id), reverse=True)
+        except (
+            httpx.HTTPError,
+            httpx.InvalidURL,
+            TimeoutError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as exc:
             raise PublicTaskError(
                 "模型重排服务调用失败或返回了无效结果。",
                 code="reranker_failed",

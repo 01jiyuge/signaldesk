@@ -1,6 +1,6 @@
 # SignalDesk 技术架构与接口
 
-范围：当前 V0.4.2，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，历史分页与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)。代码与运行验证分别记录在 [ROADMAP.md](./ROADMAP.md)。
+范围：当前 V0.4.3，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，历史分页与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)。代码与运行验证分别记录在 [ROADMAP.md](./ROADMAP.md)。 本轮采集、检索与接口交互升级见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。
 
 ## 1. 技术选择与边界
 

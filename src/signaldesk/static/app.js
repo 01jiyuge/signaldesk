@@ -9,10 +9,12 @@
   const changeNames = { baseline: "首次记录", changed: "检测到变化", unchanged: "与上次一致", new: "新增来源" };
   const stageNames = { collect: "采集原始来源", collecting: "采集原始来源", fetch: "采集原始来源", compare: "比较历史快照", analyze: "分析变化与影响", analyzing: "分析变化与影响", research: "开展自主调研", verify: "检查引用一致性", verify_evidence: "检查引用一致性", report: "整理研究报告", persist: "保存研究记录", completed: "研究已完成", queued: "任务已加入队列", running: "研究正在进行" };
   const stages = ["collect", "compare", "research", "verify", "persist"];
-  const state = { projects: [], project: null, runs: [], run: null, events: [], eventAfter: 0, health: null, tab: "report", timer: null, epoch: 0, actionBusy: false, exportBusy: false, runsLoading: false, searchEpoch: 0, pollingError: "", editProjectId: null, extraFocus: [], disconnected: false, streamController: null, streamTimer: null, streamRunId: null, streamStatus: "idle", streamSupported: null, backgroundStreams: new Map() };
+  const state = { projects: [], project: null, runs: [], run: null, events: [], eventAfter: 0, health: null, tab: "report", timer: null, epoch: 0, actionBusy: false, exportBusy: false, runsLoading: false, searchEpoch: 0, searchController: null, pollingError: "", editProjectId: null, projectFormEpoch: 0, extraFocus: [], disconnected: false, connectionEpoch: 0, connectionStatus: "connecting", connectionBlocked: true, connectionController: null, streamController: null, streamTimer: null, streamRunId: null, streamStatus: "idle", streamSupported: null, backgroundStreams: new Map() };
   let toastTimer;
   let memoryEpoch = 0;
   let memoryBusy = false;
+  let memoryController = null;
+  let memoryFormEpoch = 0;
   const extensions = { capabilities: null, capabilityError: "", loading: false, capabilityEpoch: 0, context: null, submissions: new Map() };
   const sandboxActive = new Set(["queued", "running", "pending", "cancelling", "canceling"]);
   const delegationActive = new Set(["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"]);
@@ -35,16 +37,29 @@
     return "服务暂时无法完成请求，请稍后重试。";
   }
 
+  function renderConnectionControls() {
+    const blocked = state.connectionBlocked || state.disconnected;
+    $("submit-project").disabled = blocked || state.actionBusy;
+    $("save-memory").disabled = blocked || memoryBusy;
+    $("search-evidence").disabled = blocked || !!state.searchController;
+    document.querySelectorAll('[data-write-action="memory-delete"]').forEach((button) => { button.disabled = blocked || memoryBusy; });
+  }
+
   function connectionState(disconnected, message = "") {
     state.disconnected = disconnected;
-    $("connection-notice").hidden = !disconnected;
-    $("connection-message").textContent = message || "与研究服务的连接暂时中断。已有结果仍可查看，后台任务不会因关闭页面而停止。";
-    $("health-dot").className = `health-dot ${disconnected ? "offline" : "online"}`;
-    $("health-label").textContent = disconnected ? "连接中断 · 点击重连" : "服务已连接";
-    renderMode(); renderExport(); renderExtensionAvailability();
+    const labels = { connecting: "正在验证服务连接", auth_error: "访问验证失败 · 检查 Token", error: "服务连接失败 · 点击重连", ready: "服务已连接" };
+    const messages = { connecting: "正在验证 API 访问权限，验证完成后可提交操作。已有任务继续在后台运行。", auth_error: "API 访问验证未通过。请在「服务连接」填写正确的 API Token 后重新连接。", error: "暂时无法验证 API 访问权限，请重新连接。已有结果仍可查看，后台任务继续运行。" };
+    $("connection-notice").hidden = !disconnected && !state.connectionBlocked;
+    $("connection-message").textContent = message || (disconnected ? "与研究服务的连接暂时中断。已有结果仍可查看，后台任务不会因关闭页面而停止。" : messages[state.connectionStatus]) || "";
+    $("health-dot").className = `health-dot ${disconnected || state.connectionBlocked ? "offline" : "online"}`;
+    $("health-label").textContent = disconnected ? "连接中断 · 点击重连" : labels[state.connectionStatus] || labels.error;
+    if (!state.projects.length) renderProjects();
+    renderMode(); renderExport(); renderProgress(); renderExtensionAvailability();
   }
 
   async function request(path, options = {}) {
+    const connectionEpoch = state.connectionEpoch;
+    if (!["GET", "HEAD"].includes((options.method || "GET").toUpperCase()) && (state.connectionBlocked || state.disconnected)) throw new Error("服务访问权限尚未验证，请在「服务连接」重新连接后再提交操作。");
     const headers = new Headers(options.headers || {});
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
@@ -54,10 +69,13 @@
     try { response = await fetch(`/api${path}`, { ...options, headers, cache: "no-store" }); }
     catch (error) {
       if (options.signal?.aborted || error.name === "AbortError") throw error;
-      connectionState(true);
+      if (connectionEpoch === state.connectionEpoch) connectionState(true);
       throw new Error("无法连接研究服务，正在等待恢复连接。请确认服务已启动，或点击「重新连接」。");
     }
-    if (state.disconnected) connectionState(false);
+    if (connectionEpoch === state.connectionEpoch) {
+      if ([401, 403].includes(response.status)) { state.connectionStatus = "auth_error"; state.connectionBlocked = true; connectionState(false); }
+      else if (state.disconnected) connectionState(false);
+    }
     return response;
   }
 
@@ -141,7 +159,11 @@
 
   function renderProjects() {
     const list = $("project-list"); list.replaceChildren();
-    if (!state.projects.length) { list.append(node("p", "sidebar-hint", "暂无项目，开始第一份研究")); return; }
+    if (!state.projects.length) {
+      const hints = { connecting: "正在验证工作区访问权限…", auth_error: "访问未验证，请检查 Token 后重新连接。", error: "工作区连接未验证，请重新连接。" };
+      const message = state.connectionBlocked ? hints[state.connectionStatus] || hints.error : state.disconnected ? "工作区暂时无法连接，请稍后重试。" : "暂无项目，开始第一份研究";
+      list.append(node("p", "sidebar-hint", message)); return;
+    }
     state.projects.forEach((project, index) => {
       const button = node("button", `project-nav${state.project?.id === project.id ? " active" : ""}`);
       button.type = "button"; button.title = project.name;
@@ -176,11 +198,12 @@
     $("demo-notice").hidden = !demo;
     $("live-config-notice").hidden = demo || state.health?.live_configured !== false;
     $("run-mode-hint").textContent = demo ? "内置虚构样本 · 无需模型 Key" : state.health?.live_configured ? "真实来源 · 使用服务端模型配置" : "真实调研未配置：请在服务端配置模型 Key";
-    $("start-run").disabled = state.actionBusy || projectActive() || state.runsLoading || state.disconnected || (!demo && state.health?.live_configured === false);
+    $("start-run").disabled = state.actionBusy || projectActive() || state.runsLoading || state.connectionBlocked || state.disconnected || (!demo && state.health?.live_configured === false);
     $("start-run").title = !demo && state.health?.live_configured === false ? "请先配置服务端模型环境变量，再重新连接服务" : "";
-    $("edit-project").disabled = state.actionBusy || projectActive() || state.runsLoading || state.disconnected;
+    $("edit-project").disabled = state.actionBusy || projectActive() || state.runsLoading || state.connectionBlocked || state.disconnected;
     $("edit-project").title = projectActive() ? "项目有等待或执行中的任务，结束后可编辑；已有历史会保留" : state.runsLoading ? "正在读取任务状态" : "编辑项目、关注来源与研究重点";
     $("edit-lock-note").hidden = !projectActive();
+    renderConnectionControls();
   }
 
   function renderExport() {
@@ -188,8 +211,8 @@
     const result = reportResult();
     $("report-result-type").textContent = result.label;
     $("report-result-type").className = `result-label ${result.kind}`;
-    $("export-markdown").disabled = state.exportBusy || state.disconnected;
-    $("export-json").disabled = state.exportBusy || state.disconnected;
+    $("export-markdown").disabled = state.exportBusy || state.connectionBlocked || state.disconnected;
+    $("export-json").disabled = state.exportBusy || state.connectionBlocked || state.disconnected;
   }
 
   function renderPollingError() {
@@ -274,8 +297,8 @@
     $("resume-run").hidden = !["interrupted", "failed", "cancelled"].includes(run?.status);
     $("resume-run").textContent = run?.status === "interrupted" ? "继续研究" : "恢复研究";
     $("cancel-run").hidden = !isActive();
-    $("cancel-run").disabled = state.actionBusy;
-    $("resume-run").disabled = state.actionBusy;
+    $("cancel-run").disabled = state.actionBusy || state.connectionBlocked || state.disconnected;
+    $("resume-run").disabled = state.actionBusy || state.connectionBlocked || state.disconnected;
     const summary = $("progress-summary"); summary.replaceChildren();
     if (!run) summary.append(node("strong", "", "等待开始研究"), node("small", "", "选择模式并启动任务后，在这里查看过程。"));
     else {
@@ -568,7 +591,7 @@
   }
 
   async function startSelectedStream(epoch) {
-    if (epoch !== state.epoch || !state.run) return;
+    if (epoch !== state.epoch || !state.run || state.connectionBlocked) return;
     stopPolling();
     const runId = state.run.id; const projectId = state.project.id;
     const controller = new AbortController();
@@ -618,13 +641,13 @@
   }
 
   function syncBackgroundStreams(epoch) {
-    if (epoch !== state.epoch || state.streamSupported !== true) return;
+    if (epoch !== state.epoch || state.streamSupported !== true || state.connectionBlocked) return;
     for (const run of state.runs) {
       if (run.id === state.run?.id || !activeStatuses.has(run.status) || state.backgroundStreams.has(run.id)) continue;
       const stream = { controller: null, timer: null, cursor: 0, status: "connecting" };
       state.backgroundStreams.set(run.id, stream);
       async function watch() {
-        if (epoch !== state.epoch || state.backgroundStreams.get(run.id) !== stream) return;
+        if (epoch !== state.epoch || state.backgroundStreams.get(run.id) !== stream || state.connectionBlocked) return;
         const controller = new AbortController(); stream.controller = controller;
         let terminal = false;
         try {
@@ -658,7 +681,7 @@
   }
 
   function syncTransport(epoch, force = false) {
-    if (epoch !== state.epoch || !state.run) return;
+    if (epoch !== state.epoch || !state.run || state.connectionBlocked) return;
     if (state.streamSupported === false && !force) { state.streamStatus = "fallback"; renderTransport(); pollRun(epoch); return; }
     if (force) {
       state.streamSupported = null; state.streamController?.abort(); state.streamController = null;
@@ -672,14 +695,15 @@
 
   function resetSearch() {
     state.searchEpoch++;
+    state.searchController?.abort(); state.searchController = null;
     $("search-status").hidden = true;
-    $("search-evidence").disabled = false;
+    $("search-evidence").disabled = state.connectionBlocked || state.disconnected;
     $("evidence-content").removeAttribute("aria-busy");
   }
 
   function schedulePoll(epoch) {
     stopPolling();
-    if (state.streamSupported !== false) return;
+    if (state.streamSupported !== false || state.connectionBlocked) return;
     if ((!isActive() && !projectActive() && !state.pollingError) || epoch !== state.epoch) return;
     state.timer = setTimeout(() => pollRun(epoch), state.pollingError ? 4000 : 1000);
   }
@@ -694,7 +718,7 @@
   }
 
   async function pollRun(epoch) {
-    if (epoch !== state.epoch || !state.run || state.streamSupported !== false) return;
+    if (epoch !== state.epoch || !state.run || state.streamSupported !== false || state.connectionBlocked) return;
     const runId = state.run.id;
     try {
       const refreshProject = state.runs.some((item) => item.id !== runId && activeStatuses.has(item.status));
@@ -714,7 +738,8 @@
       state.pollingError = "";
       renderRun(!selectedChanged);
       if (run.status === "completed" && previousStatus !== "completed") {
-        renderEvidence(); toast("研究已完成，报告和原始证据已就绪。");
+        if (!$("evidence-query").value.trim()) renderEvidence();
+        toast("研究已完成，报告和原始证据已就绪。");
         if (run.mode === "demo" && run.demo_revision === 1) $("demo-revision").value = "2";
       }
       schedulePoll(epoch);
@@ -761,6 +786,7 @@
     $("research-mode").value = isDemoProject(project) ? "demo" : "live";
     $("demo-revision").value = "1"; $("evidence-query").value = "";
     setTab("report"); renderProjects(); renderSources(); renderRun(); renderEvidence();
+    memoryFormEpoch++;
     $("memory-form").reset();
     loadMemory(project.id);
     loadExtensionProject(project.id);
@@ -780,19 +806,33 @@
 
   async function connect() {
     stopTransport(); stopExtensionObservers(); state.streamSupported = null;
-    const epoch = ++state.epoch;
+    state.epoch++;
+    const connectionEpoch = ++state.connectionEpoch;
+    state.connectionController?.abort();
+    const controller = new AbortController(); state.connectionController = controller;
+    state.connectionBlocked = true; state.connectionStatus = "connecting"; state.runsLoading = true;
+    resetSearch(); $("evidence-query").value = ""; renderEvidence();
+    memoryEpoch++; memoryController?.abort(); memoryController = null;
+    $("memory-status").textContent = "项目记忆已暂停更新，请先完成服务连接验证。";
+    memoryFormEpoch++; state.projectFormEpoch++;
+    extensions.capabilityEpoch++; extensions.loading = false; extensions.submissions.clear();
     showError("");
-    $("health-label").textContent = "正在连接服务";
+    connectionState(false); renderTransport();
     try {
-      const [healthResult, projectsResult] = await Promise.allSettled([api("/health"), api("/projects")]);
-      if (epoch !== state.epoch) return;
+      const [healthResult, projectsResult] = await Promise.allSettled([api("/health", { signal: controller.signal }), api("/projects", { signal: controller.signal })]);
+      if (connectionEpoch !== state.connectionEpoch || controller.signal.aborted) return;
       state.health = healthResult.status === "fulfilled" ? healthResult.value : null;
-      loadCapabilities();
       if (state.health?.version) $("app-version").textContent = `v${state.health.version}`;
-      $("health-dot").className = `health-dot ${state.health ? "online" : "offline"}`;
-      $("health-label").textContent = state.health ? "服务已连接" : "服务连接失败";
-      $("settings-health").textContent = state.health ? `服务状态：${state.health.status || "在线"}\n真实调研：${state.health.live_configured ? "已配置" : "未配置模型，可先使用演示"}\n版本：${state.health.version || "0.2"}` : "服务未连接，请确认后端正在运行。";
-      if (projectsResult.status === "rejected") throw projectsResult.reason;
+      const access = projectsResult.status === "fulfilled" ? "API 访问验证通过" : [401, 403].includes(projectsResult.reason?.status) ? "API 访问验证失败，请检查 Token" : "API 访问尚未验证";
+      $("settings-health").textContent = state.health ? `服务状态：${state.health.status || "在线"}\n访问权限：${access}\n真实调研：${state.health.live_configured ? "已配置" : "未配置模型，可先使用演示"}\n版本：${state.health.version || "未知"}` : `服务健康检查失败。\n访问权限：${access}`;
+      if (projectsResult.status === "rejected") {
+        state.connectionStatus = [401, 403].includes(projectsResult.reason?.status) ? "auth_error" : "error";
+        connectionState(state.disconnected, projectsResult.reason.message);
+        throw projectsResult.reason;
+      }
+      state.connectionBlocked = false; state.connectionStatus = "ready"; state.runsLoading = false;
+      connectionState(false);
+      loadCapabilities();
       state.projects = collection(projectsResult.value, "projects");
       renderProjects();
       if (state.projects.length) {
@@ -800,8 +840,12 @@
         try { previousId = sessionStorage.getItem("signaldesk.projectId"); } catch { /* optional */ }
         await selectProject(state.projects.find((project) => project.id === previousId) || state.projects[0]);
       } else { state.project = null; $("welcome").hidden = false; $("project-workspace").hidden = true; $("breadcrumb-project").textContent = "项目总览"; }
-      if (healthResult.status === "rejected") showError(healthResult.reason.message);
-    } catch (error) { showError(error.message); $("welcome").hidden = !!state.project; }
+      if (connectionEpoch === state.connectionEpoch && healthResult.status === "rejected") showError(healthResult.reason.message);
+    } catch (error) {
+      if (connectionEpoch !== state.connectionEpoch || controller.signal.aborted || error.name === "AbortError") return;
+      if (state.connectionBlocked && state.connectionStatus === "connecting") { state.connectionStatus = "error"; connectionState(state.disconnected); }
+      showError(error.message); $("welcome").hidden = !!state.project;
+    } finally { if (state.connectionController === controller) state.connectionController = null; }
   }
 
   function openProjectDialog(edit = false) {
@@ -809,6 +853,7 @@
     edit = edit === true;
     if (edit && (!state.project || projectActive() || state.runsLoading)) { toast("项目有等待或执行中的任务，结束后再编辑。历史报告与快照会保留。", true); return; }
     state.editProjectId = edit ? state.project.id : null;
+    state.projectFormEpoch++;
     state.extraFocus = edit ? (state.project.focus || []).filter((focus) => !["pricing", "features", "positioning"].includes(focus)) : [];
     $("project-form").reset(); $("project-form-error").hidden = true;
     $("project-form-eyebrow").textContent = edit ? "EDIT PROJECT" : "NEW PROJECT";
@@ -823,24 +868,31 @@
       document.querySelectorAll('#project-form input[name="focus"]').forEach((input) => { input.checked = (state.project.focus || []).includes(input.value); });
     }
     $("project-dialog").showModal();
+    renderConnectionControls();
     $("project-name").focus();
   }
 
   async function createDemo() {
-    if (state.actionBusy) return;
+    if (state.actionBusy || state.connectionBlocked || state.disconnected) return;
+    const connectionEpoch = state.connectionEpoch; const epoch = state.epoch;
     const existing = state.projects.find(isDemoProject);
     if (existing) { await selectProject(existing); return; }
     state.actionBusy = true; $("welcome-demo").disabled = true;
     try {
       const project = await api("/projects", { method: "POST", body: JSON.stringify({ name: "AI 产品竞品观察", description: "演示工作区 · 观察虚构产品 Northstar 与 Orbit 的套餐价格、产品能力和定位变化。", sources: [{ name: "Northstar", url: "https://northstar.example/pricing" }, { name: "Orbit", url: "https://orbit.example/changelog" }], focus: ["pricing", "features"] }) });
-      state.projects.unshift(project); await selectProject(project); toast("演示项目已创建。先运行「① 建立基线」，再体验变化对比。");
-    } catch (error) { showError(error.message); }
+      if (connectionEpoch !== state.connectionEpoch) return;
+      if (!state.projects.some((item) => item.id === project.id)) state.projects.unshift(project);
+      renderProjects();
+      if (epoch !== state.epoch || state.connectionBlocked) return;
+      await selectProject(project); toast("演示项目已创建。先运行「① 建立基线」，再体验变化对比。");
+    } catch (error) { if (connectionEpoch === state.connectionEpoch) showError(error.message); }
     finally { state.actionBusy = false; $("welcome-demo").disabled = false; renderMode(); }
   }
 
   async function createProject(event) {
     event.preventDefault();
-    if (state.actionBusy) return;
+    if (state.actionBusy || state.connectionBlocked || state.disconnected) return;
+    const connectionEpoch = state.connectionEpoch; const formEpoch = state.projectFormEpoch;
     const errorBox = $("project-form-error"); errorBox.hidden = true;
     try {
       const sources = $("project-sources").value.split(/\r?\n/).filter((line) => line.trim()).map((line, index) => {
@@ -859,9 +911,13 @@
       state.actionBusy = true; $("submit-project").disabled = true;
       const editingId = state.editProjectId;
       const project = await api(editingId ? `/projects/${encodeURIComponent(editingId)}` : "/projects", { method: editingId ? "PUT" : "POST", body: JSON.stringify({ name, description: $("project-desc").value.trim(), sources, focus }) });
+      if (connectionEpoch !== state.connectionEpoch) return;
+      if (editingId) state.projects = state.projects.map((item) => item.id === project.id ? project : item);
+      else if (!state.projects.some((item) => item.id === project.id)) state.projects.unshift(project);
+      renderProjects();
+      if (formEpoch !== state.projectFormEpoch || state.connectionBlocked) return;
       $("project-dialog").close();
       if (editingId) {
-        state.projects = state.projects.map((item) => item.id === project.id ? project : item);
         if (state.project?.id === project.id) {
           state.project = project;
           $("project-title").textContent = project.name;
@@ -872,78 +928,85 @@
         }
         toast("修改已保存，仅影响后续研究；历史报告与快照已保留。");
       } else {
-        state.projects.unshift(project); await selectProject(project);
+        await selectProject(project);
         toast(state.health?.live_configured || isDemoProject(project) ? "项目已创建，可以开始建立研究基线。" : "项目已创建。配置服务端模型后可开始真实调研。");
       }
-    } catch (error) { errorBox.textContent = error.message; errorBox.hidden = false; }
-    finally { state.actionBusy = false; $("submit-project").disabled = false; renderMode(); }
+    } catch (error) { if (connectionEpoch === state.connectionEpoch && formEpoch === state.projectFormEpoch) { errorBox.textContent = error.message; errorBox.hidden = false; } }
+    finally { state.actionBusy = false; renderMode(); }
   }
 
   async function startRun() {
-    if (!state.project || state.actionBusy || projectActive()) return;
-    const project = state.project; const epoch = state.epoch;
+    if (!state.project || state.actionBusy || projectActive() || state.connectionBlocked || state.disconnected) return;
+    const project = state.project; const epoch = state.epoch; const connectionEpoch = state.connectionEpoch;
     const mode = $("research-mode").value;
     if (mode === "demo" && !isDemoProject(project)) { showError("演示模式仅支持 Northstar / Orbit 内置虚构来源。请为真实网址选择「真实调研」，或从首页体验演示项目。"); return; }
     if (mode === "live" && isDemoProject(project)) { showError("本项目使用 .example 演示地址。请先新建项目并填写真实来源，再启动真实调研。"); return; }
     state.actionBusy = true; renderMode(); showError("");
     try {
       const run = await api(`/projects/${encodeURIComponent(project.id)}/runs`, { method: "POST", body: JSON.stringify({ mode, demo_revision: Number($("demo-revision").value) }) });
-      if (state.project?.id !== project.id) return;
+      if (connectionEpoch !== state.connectionEpoch || state.project?.id !== project.id) return;
       updateRunList(run);
       if (epoch !== state.epoch) { renderRun(true); syncTransport(state.epoch); return; }
       setTab("report"); await selectRun(run.id);
-    } catch (error) { if (state.project?.id === project.id) showError(error.message); }
+    } catch (error) { if (connectionEpoch === state.connectionEpoch && state.project?.id === project.id) showError(error.message); }
     finally { state.actionBusy = false; renderMode(); }
   }
 
   async function runAction(action) {
-    if (!state.run || state.actionBusy) return;
-    const runId = state.run.id; const projectId = state.project.id; const epoch = state.epoch;
+    if (!state.run || state.actionBusy || state.connectionBlocked || state.disconnected) return;
+    const runId = state.run.id; const projectId = state.project.id; const epoch = state.epoch; const connectionEpoch = state.connectionEpoch;
     state.actionBusy = true; renderRun();
     try {
       const run = await api(`/runs/${encodeURIComponent(runId)}/${action}`, { method: "POST" });
-      if (state.project?.id !== projectId) return;
+      if (connectionEpoch !== state.connectionEpoch || state.project?.id !== projectId) return;
       if (run?.id) updateRunList(run);
       if (epoch !== state.epoch || state.run?.id !== runId) { renderRun(true); syncTransport(state.epoch); return; }
       if (run?.id) state.run = run;
       syncTransport(epoch, action === "resume");
       toast(action === "cancel" ? "已提交取消请求。" : "研究已恢复。");
-    } catch (error) { if (epoch === state.epoch) showError(error.message); }
+    } catch (error) { if (connectionEpoch === state.connectionEpoch && epoch === state.epoch) showError(error.message); }
     finally { state.actionBusy = false; renderRun(); }
   }
 
   async function searchEvidence() {
-    if (!state.project) return;
+    if (!state.project || state.connectionBlocked || state.disconnected) return;
     const query = $("evidence-query").value.trim();
-    const searchEpoch = ++state.searchEpoch; const projectId = state.project.id;
-    if (!query) { $("search-status").hidden = true; renderEvidence(); return; }
+    resetSearch();
+    const searchEpoch = state.searchEpoch; const projectId = state.project.id; const connectionEpoch = state.connectionEpoch;
+    if (!query) { renderEvidence(); return; }
+    const controller = new AbortController(); state.searchController = controller;
     $("search-evidence").disabled = true;
     $("search-status").hidden = false;
     $("search-status").textContent = "正在搜索项目的历史证据…";
     $("evidence-content").setAttribute("aria-busy", "true");
     empty($("evidence-content"), "正在查找相关证据", "按关键词检索本项目已保存的来源快照。", "◎", true);
     try {
-      const result = await api(`/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(query)}`);
-      if (searchEpoch !== state.searchEpoch || state.project?.id !== projectId) return;
+      const result = await api(`/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(query)}`, { signal: controller.signal });
+      if (controller.signal.aborted || connectionEpoch !== state.connectionEpoch || searchEpoch !== state.searchEpoch || state.project?.id !== projectId) return;
       renderEvidence(collection(result, "evidence"), true);
       $("search-status").hidden = true;
-    } catch (error) { if (searchEpoch === state.searchEpoch) { empty($("evidence-content"), "暂时无法搜索历史证据", error.message, "!"); } }
-    finally { if (searchEpoch === state.searchEpoch) { $("search-evidence").disabled = false; $("search-status").hidden = true; $("evidence-content").removeAttribute("aria-busy"); } }
+    } catch (error) { if (!controller.signal.aborted && error.name !== "AbortError" && connectionEpoch === state.connectionEpoch && searchEpoch === state.searchEpoch) { empty($("evidence-content"), "暂时无法搜索历史证据", error.message, "!"); } }
+    finally {
+      if (state.searchController === controller) state.searchController = null;
+      if (connectionEpoch === state.connectionEpoch && searchEpoch === state.searchEpoch) { $("search-status").hidden = true; $("evidence-content").removeAttribute("aria-busy"); renderConnectionControls(); }
+    }
   }
 
   async function exportReport(format) {
-    if (!state.run?.report || state.run.status !== "completed" || state.exportBusy) return;
-    const runId = state.run.id;
+    if (!state.run?.report || state.run.status !== "completed" || state.exportBusy || state.connectionBlocked || state.disconnected) return;
+    const runId = state.run.id; const connectionEpoch = state.connectionEpoch;
     state.exportBusy = true; renderExport();
     try {
       const response = await request(`/runs/${encodeURIComponent(runId)}/export?format=${encodeURIComponent(format)}`, { headers: { Accept: format === "json" ? "application/json" : "text/markdown" } });
       if (!response.ok) throw await responseError(response);
-      const url = URL.createObjectURL(await response.blob());
+      const blob = await response.blob();
+      if (connectionEpoch !== state.connectionEpoch) return;
+      const url = URL.createObjectURL(blob);
       const link = node("a"); link.href = url; link.download = `signaldesk-${runId.slice(0, 8)}.${format === "markdown" ? "md" : "json"}`;
       document.body.append(link); link.click(); link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
       toast(`${format === "markdown" ? "Markdown" : "JSON"} 报告已导出。`);
-    } catch (error) { toast(`报告导出失败：${error.message}`, true); }
+    } catch (error) { if (connectionEpoch === state.connectionEpoch) toast(`报告导出失败：${error.message}`, true); }
     finally { state.exportBusy = false; renderExport(); }
   }
 
@@ -955,7 +1018,7 @@
     try { sessionStorage.setItem(`signaldesk.extensionTasks.${projectId}`, JSON.stringify({ ...extensionStorage(projectId), ...values })); } catch { /* Task IDs can still be followed in the current page. */ }
   }
 
-  function isExtensionCurrent(context) { return extensions.context === context && state.project?.id === context.projectId; }
+  function isExtensionCurrent(context) { return !state.connectionBlocked && extensions.context === context && state.project?.id === context.projectId; }
 
   function beginExtensionSubmission(context, kind) {
     const ticket = {};
@@ -1029,14 +1092,14 @@
     }
     if (extensions.capabilities?.a2a?.available === true && !remotes.length) $("a2a-reason").textContent += " 尚未配置允许委托的远端 Agent，暂不能提交远端研究。";
     const context = extensions.context;
-    const online = !!context && !state.disconnected && !extensions.loading && !extensions.capabilityError;
+    const online = !!context && !state.connectionBlocked && !state.disconnected && !extensions.loading && !extensions.capabilityError;
     $("submit-sandbox").disabled = !online || sandbox?.enabled !== true || sandbox?.available !== true || context.sandbox.busy;
     $("submit-a2a").disabled = !online || extensions.capabilities?.a2a?.enabled !== true || extensions.capabilities?.a2a?.available !== true || !selected || context.a2a.busy;
     $("a2a-remote").disabled = !remotes.length || !!context?.a2a.busy;
     $("sandbox-project-context").textContent = state.project ? `当前项目：${state.project.name}` : "先选择一个项目";
     $("sandbox-link-run").disabled = !state.run || state.run.project_id !== state.project?.id;
     for (const name of ["sandbox", "a2a"]) {
-      $("cancel-" + name).disabled = !context || context[name].busy || state.disconnected;
+      $("cancel-" + name).disabled = !context || context[name].busy || state.connectionBlocked || state.disconnected;
       $("refresh-" + name).disabled = !context || context[name].busy || context[name].listLoading || state.disconnected;
       $(name + "-history").disabled = !context || context[name].busy;
       $("load-more-" + name).disabled = !context || context[name].busy || context[name].listLoading || state.disconnected;
@@ -1389,13 +1452,15 @@
   }
 
   async function loadMemory(projectId = state.project?.id) {
-    if (!projectId) return;
+    if (!projectId || state.connectionBlocked) return;
     const ticket = ++memoryEpoch;
+    const connectionEpoch = state.connectionEpoch;
+    memoryController?.abort(); const controller = new AbortController(); memoryController = controller;
     $("memory-status").textContent = "正在读取项目记忆…";
     $("memory-items").replaceChildren(); $("memory-runs").replaceChildren();
     try {
-      const context = await api(`/projects/${encodeURIComponent(projectId)}/memory`);
-      if (ticket !== memoryEpoch || state.project?.id !== projectId) return;
+      const context = await api(`/projects/${encodeURIComponent(projectId)}/memory`, { signal: controller.signal });
+      if (controller.signal.aborted || connectionEpoch !== state.connectionEpoch || ticket !== memoryEpoch || state.project?.id !== projectId) return;
       const preferences = collection(context, "preferences");
       if (!preferences.length) $("memory-items").append(node("p", "memory-note", "尚未设置明确偏好。"));
       preferences.forEach((item) => {
@@ -1403,23 +1468,28 @@
         const heading = node("div", "memory-item-heading");
         const edit = node("button", "text-button", "编辑"); edit.type = "button";
         edit.addEventListener("click", () => {
+          memoryFormEpoch++;
           $("memory-key").value = item.key; $("memory-value").value = memoryText(item.value);
           $("memory-value").focus();
         });
         const remove = node("button", "text-button", "移除"); remove.type = "button";
+        remove.dataset.writeAction = "memory-delete";
+        remove.disabled = memoryBusy || state.connectionBlocked || state.disconnected;
         remove.setAttribute("aria-label", `移除偏好${item.key}`);
         remove.addEventListener("click", async () => {
-          if (memoryBusy || state.project?.id !== projectId) return;
+          if (memoryBusy || state.connectionBlocked || state.disconnected || state.project?.id !== projectId) return;
+          const actionConnectionEpoch = state.connectionEpoch; const actionFormEpoch = memoryFormEpoch;
           memoryBusy = true; remove.disabled = true; $("save-memory").disabled = true;
           try {
             await api(`/projects/${encodeURIComponent(projectId)}/memory/${encodeURIComponent(item.key)}`, { method: "DELETE" });
-            if (state.project?.id === projectId) {
-              if ($("memory-key").value === item.key) $("memory-form").reset();
-              await loadMemory(projectId); toast("该明确偏好已移除。" );
+            if (actionConnectionEpoch === state.connectionEpoch && state.project?.id === projectId) {
+              if (actionFormEpoch === memoryFormEpoch && $("memory-key").value === item.key) { memoryFormEpoch++; $("memory-form").reset(); }
+              await loadMemory(projectId);
+              if (actionConnectionEpoch === state.connectionEpoch && state.project?.id === projectId) toast("该明确偏好已移除。" );
             }
           } catch (error) {
-            if (state.project?.id === projectId) $("memory-status").textContent = `偏好未移除：${error.message}`;
-          } finally { memoryBusy = false; remove.disabled = false; $("save-memory").disabled = false; }
+            if (actionConnectionEpoch === state.connectionEpoch && state.project?.id === projectId) $("memory-status").textContent = `偏好未移除：${error.message}`;
+          } finally { memoryBusy = false; renderConnectionControls(); }
         });
         const actions = node("div", "memory-item-actions"); actions.append(edit, remove);
         heading.append(node("strong", "", item.key), actions);
@@ -1435,14 +1505,14 @@
       });
       $("memory-status").textContent = "偏好仅在你保存时写入；网页内容不会自动成为偏好。";
     } catch (error) {
-      if (ticket === memoryEpoch && state.project?.id === projectId) $("memory-status").textContent = `暂时无法读取项目记忆：${error.message}`;
-    }
+      if (!controller.signal.aborted && error.name !== "AbortError" && connectionEpoch === state.connectionEpoch && ticket === memoryEpoch && state.project?.id === projectId) $("memory-status").textContent = `暂时无法读取项目记忆：${error.message}`;
+    } finally { if (memoryController === controller) memoryController = null; }
   }
 
   async function saveMemory(event) {
     event.preventDefault();
-    if (!state.project || memoryBusy) return;
-    const projectId = state.project.id;
+    if (!state.project || memoryBusy || state.connectionBlocked || state.disconnected) return;
+    const projectId = state.project.id; const connectionEpoch = state.connectionEpoch; const formEpoch = memoryFormEpoch;
     const key = $("memory-key").value.trim(); const text = $("memory-value").value.trim();
     if (!key || !text) return;
     memoryBusy = true; $("save-memory").disabled = true;
@@ -1451,11 +1521,13 @@
       await api(`/projects/${encodeURIComponent(projectId)}/memory/${encodeURIComponent(key)}`, {
         method: "PUT", body: JSON.stringify({ value: { text } }),
       });
-      if (state.project?.id !== projectId) return;
-      $("memory-form").reset(); await loadMemory(projectId); toast("明确偏好已保存，下次真实研究会读取。" );
+      if (connectionEpoch !== state.connectionEpoch || state.project?.id !== projectId) return;
+      if (formEpoch === memoryFormEpoch) { memoryFormEpoch++; $("memory-form").reset(); }
+      await loadMemory(projectId);
+      if (connectionEpoch === state.connectionEpoch && state.project?.id === projectId) toast("明确偏好已保存，下次真实研究会读取。" );
     } catch (error) {
-      if (state.project?.id === projectId) $("memory-status").textContent = `偏好未保存：${error.message}`;
-    } finally { memoryBusy = false; $("save-memory").disabled = false; }
+      if (connectionEpoch === state.connectionEpoch && state.project?.id === projectId) $("memory-status").textContent = `偏好未保存：${error.message}`;
+    } finally { memoryBusy = false; renderConnectionControls(); }
   }
 
   ["add-project", "add-project-small", "welcome-new", "topbar-add"].forEach((id) => $(id).addEventListener("click", openProjectDialog));
@@ -1493,9 +1565,12 @@
     $("a2a-project").value = selected?.project_id || ""; $("a2a-project").dataset.defaultRemote = selected?.name || ""; renderExtensionAvailability();
   });
   $("a2a-mode").addEventListener("change", () => { $("a2a-revision-wrap").hidden = $("a2a-mode").value !== "demo"; });
-  $("form-demo").addEventListener("click", () => { $("project-dialog").close(); createDemo(); });
+  $("form-demo").addEventListener("click", () => { state.projectFormEpoch++; $("project-dialog").close(); createDemo(); });
   $("welcome-demo").addEventListener("click", createDemo);
   $("project-form").addEventListener("submit", createProject);
+  $("project-form").addEventListener("input", () => { state.projectFormEpoch++; });
+  $("project-dialog").addEventListener("cancel", () => { state.projectFormEpoch++; });
+  $("memory-form").addEventListener("input", () => { memoryFormEpoch++; });
   $("start-run").addEventListener("click", startRun);
   $("research-mode").addEventListener("change", () => { showError(""); renderMode(); });
   $("run-selector").addEventListener("change", (event) => selectRun(event.target.value));
@@ -1520,13 +1595,13 @@
     catch { toast("当前浏览器禁用了会话存储，无法保存 Token。", true); return; }
     $("settings-dialog").close(); await connect();
   });
-  document.querySelectorAll(".close-dialog").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
+  document.querySelectorAll(".close-dialog").forEach((button) => button.addEventListener("click", () => { const dialog = button.closest("dialog"); if (dialog.id === "project-dialog") state.projectFormEpoch++; dialog.close(); }));
   window.addEventListener("pagehide", stopTransport);
   window.addEventListener("pagehide", stopExtensionObservers);
   window.addEventListener("pageshow", (event) => { if (event.persisted && state.run) syncTransport(state.epoch); });
   window.addEventListener("pageshow", (event) => { if (event.persisted && state.project) loadExtensionProject(state.project.id); });
   window.addEventListener("offline", () => connectionState(true, "浏览器当前离线。已有研究结果仍保留，恢复网络后可重新连接。"));
-  window.addEventListener("online", () => { if (state.run) syncTransport(state.epoch, true); else connect(); });
+  window.addEventListener("online", () => { if (state.run && !state.connectionBlocked) syncTransport(state.epoch, true); else connect(); });
   setInterval(() => { if (isActive()) updateElapsed(); }, 1000);
   connect();
 })();

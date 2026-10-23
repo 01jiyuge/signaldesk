@@ -8,12 +8,13 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import insert, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from signaldesk.collector import content_hash
 from signaldesk.config import Settings
+from signaldesk.db import Snapshot
 from signaldesk.repository import Repository
 from signaldesk.retrieval import Retriever
 from signaldesk.schemas import ProjectCreate, RunCreate, SnapshotRecord
@@ -118,6 +119,38 @@ async def test_postgres_real_gin_fulltext_obeys_latest_successful_project_scope(
         assert not {old.id, failed.id, private.id} & {hit.evidence_id for hit in hits}
     for query in ["OldBeacon", "obsoletebeacon", "failedbeacon", "privatebeacon"]:
         assert await retriever.search(own.id, query) == []
+
+
+async def test_postgres_latest_sources_precede_history_candidate_limit(postgres_schema):
+    repo, settings, _, retrievers = postgres_schema
+    own = await project(repo, "Long-lived sources")
+    target = await revision(repo, own, "套餐信息", "套餐价格从29变为39。", 0)
+    noisy = await revision(repo, own, "Updates", "Unrelated update", 1, source=1)
+    # One completed run can contain multiple source snapshots. Bulk insertion
+    # recreates a large imported history without paying 1000 transaction costs.
+    at = datetime(2026, 10, 23, tzinfo=UTC)
+    rows = [
+        dict(
+            id=f"history-{index:04d}",
+            run_id=noisy.run_id,
+            project_id=own.id,
+            source_name="Updates",
+            url=noisy.url,
+            title="Updates",
+            text="Unrelated update",
+            content_hash=content_hash("Unrelated update"),
+            created_at=at,
+        )
+        for index in range(1000)
+    ]
+    async with repo.engine.begin() as connection:
+        await connection.execute(insert(Snapshot), rows)
+    assert [hit.id for hit in await repo.search_snapshots(own.id, "价格")] == [target.id]
+    assert [hit.id for hit in await repo.search_snapshots(own.id, "Unrelated")] == ["history-0999"]
+    retriever = Retriever(repo, settings)
+    retrievers.append(retriever)
+    await retriever.initialize()
+    assert [hit.evidence_id for hit in await retriever.search(own.id, "价格")] == [target.id]
 
 
 class ScriptedEmbeddings:

@@ -4,6 +4,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -104,6 +105,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "code": exc.code,
                 "retryable": exc.retryable,
                 "suggestion": exc.suggestion,
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, exc: RequestValidationError):
+        # Validation may include raw bytes, nonfinite numbers or private input.
+        # Preserve actionable locations/messages without serializing that input.
+        def safe_text(value):
+            return str(value).encode("utf-8", errors="replace").decode("utf-8")
+
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "loc": [
+                            part if isinstance(part, int) else safe_text(part)
+                            for part in error["loc"]
+                        ],
+                        "msg": safe_text(error["msg"]),
+                        "type": safe_text(error["type"]),
+                    }
+                    for error in exc.errors()
+                ]
             },
         )
 

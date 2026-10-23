@@ -5,8 +5,34 @@ non-streaming write endpoints are buffered; SSE, other reads and ASGI lifespan
 messages retain their original receive/send behavior.
 """
 
+import json
+import math
+
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+class InvalidJSONValueError(ValueError):
+    """Valid JSON syntax containing values unsafe for UTF-8/standard JSON."""
+
+
+def _standard_json(body: bytes) -> None:
+    """Reject values that cannot safely cross JSON, UTF-8 and database boundaries."""
+    pending = [json.loads(body)]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise InvalidJSONValueError("Invalid Unicode text") from exc
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise InvalidJSONValueError("Nonfinite JSON number")
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
 
 
 class RequestBodyLimitMiddleware:
@@ -77,6 +103,47 @@ class RequestBodyLimitMiddleware:
         # or JSON parsers run, including requests with no/truncated Content-Length.
         buffered = bytes(body)
         body.clear()
+        content_type = (
+            next(
+                (
+                    value
+                    for name, value in scope.get("headers", [])
+                    if name.lower() == b"content-type"
+                ),
+                b"application/json",
+            )
+            .split(b";", 1)[0]
+            .strip()
+            .lower()
+        )
+        api_json = path == "/api" or path.startswith("/api/")
+        # A2A errors must retain their JSON-RPC envelope. In particular, never
+        # reflect an unsafe request id back through the SDK's JSON serializer.
+        if buffered and (
+            not api_json or content_type == b"application/json" or content_type.endswith(b"+json")
+        ):
+            try:
+                _standard_json(buffered)
+            except (ValueError, UnicodeError, RecursionError, OverflowError) as exc:
+                if not api_json:
+                    invalid_value = isinstance(exc, InvalidJSONValueError)
+                    await JSONResponse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {
+                                "code": -32600 if invalid_value else -32700,
+                                "message": "Invalid Request" if invalid_value else "Parse error",
+                            },
+                        }
+                    )(scope, receive, send)
+                    return
+                await reject(
+                    422,
+                    "invalid_json_body",
+                    "请求体必须是包含有效 Unicode 文本和有限数值的标准 JSON。",
+                )
+                return
         replayed = False
 
         async def replay():
