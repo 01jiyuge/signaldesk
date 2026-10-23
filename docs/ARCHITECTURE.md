@@ -1,6 +1,6 @@
 # SignalDesk 技术架构与接口
 
-范围：当前 V0.4.3，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，历史分页与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)。代码与运行验证分别记录在 [ROADMAP.md](./ROADMAP.md)。 本轮采集、检索与接口交互升级见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。
+范围：当前 V0.4.4，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，历史分页与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。本轮状态、索引与协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
 
 ## 1. 技术选择与边界
 
@@ -70,7 +70,7 @@ stateDiagram-v2
 | collect | 项目、竞品、来源、模式 | 来源快照、采集时间、指纹、失败列表 | demo 只读内置夹具；live 的错误不得触发 demo |
 | compare | 当前快照、历史基线 | 可复核变化候选、无变化/初始基线结果 | 抓取失败不等于删除；同一指纹不重复制造变化 |
 | research | 变化候选、历史片段、Skills | 带引用的分析草稿与待核实问题 | 搜索与工具轮次受限；网页文本没有指令权限 |
-| verify | 报告草稿与证据 | 通过引用一致性校验的报告或明确错误 | 检查 evidence_id 存在且原文包含 quote；不能证明事实真实或推断成立 |
+| verify | 报告草稿与证据 | 通过引用一致性校验的报告或明确错误 | 检查标准 UTF-8/有限 JSON、证据 ID 唯一且原文包含 quote；不能证明事实真实或推断成立 |
 | persist | 核验结果、运行标识 | 业务记录、报告、完成状态 | 同一运行重复执行要幂等，数据库事务与唯一键兜底 |
 
 图状态在工作流模块中定义，保存运行、来源快照、变化、证据和报告所需数据。报告的 `findings[].citations[]` 包含 `evidence_id` 与 `quote`；校验“有引用”只是最低一致性检查，不代表引文支持全部 detail、资料本身正确或因果关系成立。大段来源正文与图状态的存储成本需要观测；未来可以用对象存储/文件引用替换大对象，但 V0.1 不因此引入未实现的存储依赖。
@@ -133,7 +133,7 @@ erDiagram
 
 ### 去重与一致性
 
-`save_snapshot` 按快照 ID 合并写入，检查 ID 不跨项目/运行复用。`runs` 的部分唯一索引与应用锁保护项目活动运行约束；不同项目可在同一进程的有界并发池执行。历史比较只选择同项目、同来源 URL、已完成运行的最新快照，不以失败运行建立新基线。内容 hash 识别正文是否变化；每次运行仍可以留下快照和报告，当前不宣称具备跨运行“事件级去重账本”。
+`save_snapshot` 按快照 ID 合并写入，检查 ID 不跨项目/运行复用。`runs` 的部分唯一索引与应用锁保护项目活动运行约束；不同项目可在同一进程的有界并发池执行。项目锁按持有者和等待者计数，完成、异常或取消后回收，缺失项目 ID 不留下永久锁。历史比较只选择同项目、同来源 URL、已完成运行的最新快照，不以失败运行建立新基线。内容 hash 识别正文是否变化；每次运行仍可以留下快照和报告，当前不宣称具备跨运行“事件级去重账本”。
 
 应用数据库会话在请求或短事务内创建，不能在单例 Agent 中跨并发任务复用 SQLAlchemy session。SQLite 用于本地单进程验证；PostgreSQL 用于正式运行路径。多 worker、迁移和备份恢复需单独验证后再开放。
 
@@ -177,7 +177,7 @@ skills/
 
 - PostgreSQL 使用 `to_tsvector('simple', ...)`、`websearch_to_tsquery`、`ts_rank_cd` 和 GIN 表达式索引；SQLite 使用 FTS5 与同步触发器，启动时补齐旧快照。
 - `simple` 和 SQLite 默认分词器不提供专门中文分词。全文能力已验证，未做大数据量性能或中文相关性评测。
-- 显式启用 pgvector 后，为首次或变更的 live 来源嵌入；相同正文可复用旧向量，但检索返回最新快照。新正文没有向量时不能错误复用旧正文向量。
+- 显式启用 pgvector 后，全部当前 live 快照统一检查缺失向量。复用其他运行要求同项目、同 URL、同正文 hash 且运行已完成；本次相同快照 ID 已落库的向量也可在报告保存失败后重试复用。未变化来源没有可复用向量时补齐，检索仍返回最新成功快照。这覆盖先关闭、后启用向量检索的项目，不负责嵌入模型或维度迁移。新正文没有向量时不能错误复用旧正文向量。
 - 各召回通道按 RRF 融合，再由 `RERANKER_PROVIDER=none|lexical|http` 重排。默认 lexical 是确定性词法基线；http 使用 Cohere 风格请求与响应校验，可接模型服务。服务错误明确返回，不静默改用本地排序。
 - `SearchHit` 返回 `retrieval_methods`、`retrieval_score`、`rerank_score` 和 `strategy`，便于区分实际执行的通道。
 - 向量模式需要 PostgreSQL、嵌入模型/维度/密钥。demo 不生成向量；没有向量候选时不调用查询嵌入。未实现旧数据嵌入回填、ANN 调优或模型切换迁移。
@@ -194,7 +194,7 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 
 ## 8. 当前 HTTP API
 
-路由位于 `src/signaldesk/api.py`。服务默认 `127.0.0.1:8000`，进度优先通过 AG-UI/SSE 订阅，带游标的 JSON 事件接口保留为兼容回退。配置 `API_TOKEN` 后，除健康检查外的 API 需要 `Authorization: Bearer <token>`；这是一种共享 token 保护，不是多用户鉴权。
+路由位于 `src/signaldesk/api.py`。服务默认 `127.0.0.1:8000`，进度优先通过 AG-UI/SSE 订阅，带游标的 JSON 事件接口保留为兼容回退。配置 `API_TOKEN` 后，除健康检查外的 API 需要 `Authorization: Bearer <token>`；各业务和协议入口通过 `auth.py` 使用相同的 ASCII 字节常量时间比较，非 ASCII 凭据返回 401。这是一种共享 token 保护，不是多用户鉴权。
 
 | 能力 | 方法与路由目标 | 请求/响应要点 |
 | --- | --- | --- |
@@ -208,8 +208,8 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 | 运行列表 | `GET /api/runs?project_id=...` | project_id 可选；返回按创建时间倒序的 RunRead 数组 |
 | 运行状态与报告 | `GET /api/runs/{run_id}` | 返回 RunRead；报告保存在 report 字段，没有独立 /report 路由 |
 | 导出报告 | `GET /api/runs/{run_id}/export?format=markdown\|json` | 完整的已完成报告作为附件下载；认证与其他业务 API 相同 |
-| 增量事件 | `GET /api/runs/{run_id}/events?after=N` | 只返回此运行 id>N 的事件数组；客户端保存最后事件 ID |
-| AG-UI 事件流 | `GET /api/runs/{run_id}/ag-ui?after=N` | `text/event-stream`；支持 Last-Event-ID 与 Bearer |
+| 增量事件 | `GET /api/runs/{run_id}/events?after=N` | 只返回此运行 id>N 的事件数组；after 范围为 0–2147483647 |
+| AG-UI 事件流 | `GET /api/runs/{run_id}/ag-ui?after=N` | `text/event-stream`；Last-Event-ID 与 after 使用相同数据库游标范围，越界 422 |
 | 项目记忆 | `GET /api/projects/{project_id}/memory?limit=10` | 明确偏好与最近运行摘要 |
 | 单项偏好 | `GET/PUT/DELETE /api/projects/{project_id}/memory/{key}` | PUT 接收 `{ "value": { ... } }`，DELETE 成功 204 |
 | 手动恢复 | `POST /api/runs/{run_id}/resume` | interrupted/failed/cancelled 可申请恢复，成功 202；执行器继续检查图状态 |
@@ -217,7 +217,7 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 | 历史检索 | `GET /api/projects/{project_id}/search?q=...&limit=5` | q 长度 1–1000，limit 1–20；返回匹配证据或空数组 |
 | 只读 MCP | 独立 `signaldesk-mcp` 命令 | 默认 stdio 服务，不是上述 HTTP API 下的一组写路由 |
 
-错误语义：401 表示 token 缺失或不正确；404 表示资源不存在；422 表示输入或 live 配置不合法；409 表示项目有活动任务、恢复/取消状态冲突或执行器正在关闭。请求恢复成功只表示加入队列，不能据 202 声称最终已经恢复完成。
+错误语义：401 表示 token 缺失或不正确；404 表示资源不存在；422 表示输入或 live 配置不合法；409 表示项目有活动任务、恢复/取消状态冲突、报告不可导出或执行器正在关闭。请求恢复成功只表示加入队列，不能据 202 声称最终已经恢复完成。
 
 ### AG-UI 事件契约
 
@@ -274,6 +274,7 @@ signaldesk/
 │   ├── db.py                   # 四张 SQLAlchemy 业务表
 │   ├── repository.py           # 异步持久化、基线与词法查询
 │   ├── api.py                  # HTTP 路由、token 与输入校验
+│   ├── auth.py                 # 业务与协议共用的 Bearer 校验
 │   ├── exports.py              # Markdown/JSON 附件与完整性检查
 │   ├── errors.py               # 安全错误码与处理建议
 │   ├── jobs.py                 # 单进程有界任务池与取消/恢复状态

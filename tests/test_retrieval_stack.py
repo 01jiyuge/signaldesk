@@ -146,6 +146,23 @@ async def test_fulltext_never_revives_superseded_failed_or_other_project_evidenc
 
 
 @pytest.mark.parametrize("enable_fulltext", [False, True])
+async def test_search_timestamp_keeps_utc_across_lexical_and_raw_sql(
+    sqlite_retrieval, enable_fulltext
+):
+    repo, settings, retrievers = sqlite_retrieval
+    settings = settings.model_copy(update={"enable_fulltext_search": enable_fulltext})
+    own = await new_project(repo)
+    saved = await save_revision(repo, own, title="Pricing", body="timestampneedle", sequence=1)
+    retriever = Retriever(repo, settings)
+    retrievers.append(retriever)
+    await retriever.initialize()
+    hit = (await retriever.search(own.id, "timestampneedle"))[0]
+    date = datetime.fromisoformat(hit.created_at)
+    assert date.tzinfo is not None and date.utcoffset() == timedelta(0)
+    assert date == datetime.fromisoformat(saved.created_at)
+
+
+@pytest.mark.parametrize("enable_fulltext", [False, True])
 async def test_timestamp_ties_never_revive_old_lexical_content(sqlite_retrieval, enable_fulltext):
     repo, settings, retrievers = sqlite_retrieval
     settings = settings.model_copy(update={"enable_fulltext_search": enable_fulltext})

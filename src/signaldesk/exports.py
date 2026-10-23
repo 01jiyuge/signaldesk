@@ -7,6 +7,7 @@ from urllib.parse import quote, urlsplit
 
 from pydantic import ValidationError
 
+from signaldesk.research import verify_report
 from signaldesk.schemas import FinalReport, RunRead
 
 
@@ -55,12 +56,13 @@ def _ready(run: RunRead) -> FinalReport:
     evidence = {item.id: item for item in report.evidence}
     if report.mode != run.mode or len(evidence) != len(report.evidence):
         raise ExportUnavailable("任务报告的模式或证据不一致，无法导出。")
-    for finding in report.findings:
-        for citation in finding.citations:
-            item = evidence.get(citation.evidence_id)
-            normalized = " ".join(citation.quote.split())
-            if item is None or not normalized or normalized not in " ".join(item.text.split()):
-                raise ExportUnavailable("任务报告缺少一致的引用证据，无法导出。")
+    try:
+        # JSON export retains the original envelope, including legacy extras.
+        # Check that payload too, before either exporter creates its response.
+        json.dumps(run.model_dump(), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        verify_report(report, report.evidence)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise ExportUnavailable("任务报告包含无效文本、数值或引用证据，无法导出。") from exc
     return report
 
 

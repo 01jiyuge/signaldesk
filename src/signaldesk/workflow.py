@@ -371,13 +371,8 @@ class Workflow:
         ).model_dump()
         # Vector indexing is optional and never calls an embedding API in demo mode.
         if run.mode == "live":
-            changed_ids = {item.id for item in current if item.change_type != "unchanged"}
-            await self.retriever.index_snapshots(
-                [
-                    SnapshotRecord.model_validate(item)
-                    for item in state["snapshots"]
-                    if item["id"] in changed_ids
-                ]
+            await self.retriever.backfill_missing_snapshots(
+                [SnapshotRecord.model_validate(item) for item in state["snapshots"]]
             )
         await self.repo.update_run(
             run.id, report=report, status="completed", stage="completed", error=None

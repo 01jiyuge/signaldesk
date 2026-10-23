@@ -9,7 +9,7 @@
   const changeNames = { baseline: "首次记录", changed: "检测到变化", unchanged: "与上次一致", new: "新增来源" };
   const stageNames = { collect: "采集原始来源", collecting: "采集原始来源", fetch: "采集原始来源", compare: "比较历史快照", analyze: "分析变化与影响", analyzing: "分析变化与影响", research: "开展自主调研", verify: "检查引用一致性", verify_evidence: "检查引用一致性", report: "整理研究报告", persist: "保存研究记录", completed: "研究已完成", queued: "任务已加入队列", running: "研究正在进行" };
   const stages = ["collect", "compare", "research", "verify", "persist"];
-  const state = { projects: [], project: null, runs: [], run: null, events: [], eventAfter: 0, health: null, tab: "report", timer: null, epoch: 0, actionBusy: false, exportBusy: false, runsLoading: false, searchEpoch: 0, searchController: null, pollingError: "", editProjectId: null, projectFormEpoch: 0, extraFocus: [], disconnected: false, connectionEpoch: 0, connectionStatus: "connecting", connectionBlocked: true, connectionController: null, streamController: null, streamTimer: null, streamRunId: null, streamStatus: "idle", streamSupported: null, backgroundStreams: new Map() };
+  const state = { projects: [], project: null, runs: [], run: null, events: [], eventAfter: 0, health: null, tab: "report", timer: null, epoch: 0, actionBusy: false, exportBusy: false, runsLoading: false, runGenerations: new Map(), searchEpoch: 0, searchQuery: "", searchController: null, pollingError: "", editProjectId: null, projectFormEpoch: 0, extraFocus: [], disconnected: false, connectionEpoch: 0, connectionStatus: "connecting", connectionBlocked: true, connectionController: null, streamController: null, streamTimer: null, streamRunId: null, streamStatus: "idle", streamSupported: null, backgroundStreams: new Map() };
   let toastTimer;
   let memoryEpoch = 0;
   let memoryBusy = false;
@@ -273,10 +273,33 @@
     if (focus) $("tab-" + name).focus();
   }
 
+  function compareRunTime(left, right) {
+    const a = Date.parse(left); const b = Date.parse(right);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return Number.isFinite(a) ? 1 : Number.isFinite(b) ? -1 : 0;
+    if (a !== b) return a - b;
+    // Date.parse truncates sub-millisecond precision; server timestamps retain microseconds.
+    const remainder = (value) => Number((String(value).match(/\.(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i)?.[1] || "").slice(3).padEnd(6, "0").slice(0, 6));
+    return remainder(left) - remainder(right);
+  }
+
+  function runGeneration(runId) { return state.runGenerations.get(runId) || 0; }
+
+  function invalidateRunObservation(runId) {
+    const generation = runGeneration(runId) + 1; state.runGenerations.set(runId, generation);
+    if (state.run?.id === runId) {
+      stopPolling(); state.streamController?.abort(); state.streamController = null;
+      clearTimeout(state.streamTimer); state.streamTimer = null; state.streamRunId = null; state.streamStatus = "idle";
+    }
+    const background = state.backgroundStreams.get(runId);
+    if (background) { background.controller?.abort(); clearTimeout(background.timer); state.backgroundStreams.delete(runId); }
+    return generation;
+  }
+
   function updateRunList(run) {
     const index = state.runs.findIndex((item) => item.id === run.id);
-    if (index >= 0 && new Date(state.runs[index].updated_at) > new Date(run.updated_at)) return;
+    if (index >= 0 && compareRunTime(state.runs[index].updated_at, run.updated_at) > 0) return state.runs[index];
     if (index === -1) state.runs.unshift(run); else state.runs[index] = run;
+    return run;
   }
 
   function renderRunSelector() {
@@ -544,30 +567,34 @@
     } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   }
 
-  async function applySnapshot(snapshot, runId, epoch, selected) {
+  async function applySnapshot(snapshot, runId, epoch, selected, generation) {
     const payload = snapshot?.run;
-    if (epoch !== state.epoch || !payload || payload.id !== runId || payload.project_id !== state.project?.id || !Object.hasOwn(statusNames, payload.status)) return;
+    if (epoch !== state.epoch || generation !== runGeneration(runId) || !payload || payload.id !== runId || payload.project_id !== state.project?.id || !Object.hasOwn(statusNames, payload.status)) return;
     const cached = state.runs.find((item) => item.id === runId);
-    if (cached && new Date(cached.updated_at) > new Date(payload.updated_at)) return;
-    const run = { ...cached, ...payload };
+    if (cached && compareRunTime(cached.updated_at, payload.updated_at) > 0) return;
+    let run = { ...cached, ...payload };
     if (snapshot.reportOmitted && !run.report && cached?.report) run.report = cached.report;
     if (snapshot.reportAvailable && snapshot.reportOmitted && !run.report && run.status === "completed") {
       const complete = await api(`/runs/${encodeURIComponent(runId)}`);
-      if (epoch !== state.epoch || complete.id !== runId) return;
-      run.report = complete.report;
+      if (epoch !== state.epoch || generation !== runGeneration(runId) || complete.id !== runId) return;
+      if (compareRunTime(complete.updated_at, run.updated_at) >= 0) run = { ...run, ...complete };
     }
-    updateRunList(run);
-    if (!selected || state.run?.id !== runId) { renderRun(true); renderTransport(); return; }
+    if (epoch !== state.epoch || generation !== runGeneration(runId)) return;
+    run = updateRunList(run);
+    const reportPending = snapshot.reportAvailable && snapshot.reportOmitted && run.status === "completed" && !run.report;
+    const reportPendingError = "研究已完成，报告详情尚未同步，正在重新连接获取完整报告。";
+    if (!selected || state.run?.id !== runId) { renderRun(true); renderTransport(); if (reportPending) throw new Error(reportPendingError); return; }
     const old = state.run;
     const changed = old.updated_at !== run.updated_at || old.status !== run.status || old.stage !== run.stage || old.report !== run.report;
     state.run = run; state.pollingError = "";
     renderRun(!changed);
     if (changed && !$('evidence-query').value.trim()) renderEvidence();
-    if (run.status === "completed" && old.status !== "completed") {
+    if (run.status === "completed" && (old.status !== "completed" || !old.report) && !reportPending) {
       toast("研究已完成，报告和原始证据已就绪。");
       if (run.mode === "demo" && run.demo_revision === 1) $("demo-revision").value = "2";
       loadMemory(run.project_id);
     }
+    if (reportPending) throw new Error(reportPendingError);
   }
 
   function appendStreamEvent(event, cursor, runId, epoch) {
@@ -594,37 +621,38 @@
     if (epoch !== state.epoch || !state.run || state.connectionBlocked) return;
     stopPolling();
     const runId = state.run.id; const projectId = state.project.id;
+    const generation = runGeneration(runId);
     const controller = new AbortController();
     state.streamController?.abort(); state.streamController = controller;
     state.streamRunId = runId; state.streamStatus = "connecting"; renderTransport();
     let terminal = false;
     try {
       const response = await streamResponse(runId, state.eventAfter, controller);
-      if (epoch !== state.epoch || controller.signal.aborted) return;
+      if (epoch !== state.epoch || controller.signal.aborted || generation !== runGeneration(runId)) return;
       state.streamSupported = true; state.streamStatus = "connected"; state.pollingError = "";
       renderTransport(); renderPollingError(); syncBackgroundStreams(epoch);
       await readSSE(response, async (event, cursor) => {
-        if (epoch !== state.epoch || state.run?.id !== runId || state.project?.id !== projectId) return true;
+        if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId || state.project?.id !== projectId) return true;
         if (event.type === "RUN_STARTED" && (event.runId !== runId || event.threadId !== projectId)) throw new Error("AG-UI 任务标识不匹配，已停止订阅。");
-        if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, runId, epoch, true);
+        if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, runId, epoch, true, generation);
         if (event.type === "CUSTOM" && event.name === "signaldesk.event") appendStreamEvent(event.value, cursor, runId, epoch);
         if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
           if (event.type === "RUN_FINISHED" && (event.runId !== runId || event.threadId !== projectId)) throw new Error("AG-UI 结束事件标识不匹配。");
           terminal = true;
           if (isActive()) {
             const run = await api(`/runs/${encodeURIComponent(runId)}`);
-            await applySnapshot({ run, reportAvailable: !!run.report }, runId, epoch, true);
+            await applySnapshot({ run, reportAvailable: !!run.report }, runId, epoch, true, generation);
           }
-          if (epoch === state.epoch && state.project?.id === projectId) await loadMemory(projectId);
+          if (epoch === state.epoch && generation === runGeneration(runId) && state.project?.id === projectId) await loadMemory(projectId);
           return true;
         }
         return false;
       }, controller.signal);
-      if (epoch !== state.epoch || controller.signal.aborted) return;
+      if (epoch !== state.epoch || controller.signal.aborted || generation !== runGeneration(runId)) return;
       if (!terminal) throw new Error("AG-UI 事件连接提前结束。");
       state.streamStatus = "ended"; state.pollingError = ""; renderTransport(); renderPollingError();
     } catch (error) {
-      if (epoch !== state.epoch || controller.signal.aborted || error.name === "AbortError") return;
+      if (epoch !== state.epoch || controller.signal.aborted || generation !== runGeneration(runId) || error.name === "AbortError") return;
       if ([404, 405, 501].includes(error.status)) {
         state.streamSupported = false; state.streamStatus = "fallback"; state.pollingError = "";
         for (const stream of state.backgroundStreams.values()) { stream.controller.abort(); clearTimeout(stream.timer); }
@@ -644,18 +672,19 @@
     if (epoch !== state.epoch || state.streamSupported !== true || state.connectionBlocked) return;
     for (const run of state.runs) {
       if (run.id === state.run?.id || !activeStatuses.has(run.status) || state.backgroundStreams.has(run.id)) continue;
+      const generation = runGeneration(run.id);
       const stream = { controller: null, timer: null, cursor: 0, status: "connecting" };
       state.backgroundStreams.set(run.id, stream);
       async function watch() {
-        if (epoch !== state.epoch || state.backgroundStreams.get(run.id) !== stream || state.connectionBlocked) return;
+        if (epoch !== state.epoch || generation !== runGeneration(run.id) || state.backgroundStreams.get(run.id) !== stream || state.connectionBlocked) return;
         const controller = new AbortController(); stream.controller = controller;
         let terminal = false;
         try {
           const response = await streamResponse(run.id, stream.cursor, controller);
           stream.status = "connected"; renderTransport();
           await readSSE(response, async (event, cursor) => {
-            if (epoch !== state.epoch || state.backgroundStreams.get(run.id) !== stream) return true;
-            if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, run.id, epoch, false);
+            if (epoch !== state.epoch || generation !== runGeneration(run.id) || state.backgroundStreams.get(run.id) !== stream) return true;
+            if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, run.id, epoch, false, generation);
             if (event.type === "CUSTOM" && event.name === "signaldesk.event" && event.value?.run_id === run.id) {
               const received = Number(cursor); if (Number.isSafeInteger(received)) stream.cursor = Math.max(stream.cursor, received);
             }
@@ -663,12 +692,12 @@
             return false;
           }, controller.signal);
           if (!terminal && !controller.signal.aborted) throw new Error("后台事件流提前结束。");
-          if (terminal) {
+          if (terminal && epoch === state.epoch && generation === runGeneration(run.id)) {
             state.backgroundStreams.delete(run.id); renderTransport(); renderMode();
             if (epoch === state.epoch && state.project?.id === run.project_id) await loadMemory(run.project_id);
           }
         } catch (error) {
-          if (epoch === state.epoch && !controller.signal.aborted) {
+          if (epoch === state.epoch && generation === runGeneration(run.id) && !controller.signal.aborted) {
             stream.status = "reconnecting";
             stream.timer = setTimeout(watch, 4000);
             renderTransport();
@@ -695,6 +724,7 @@
 
   function resetSearch() {
     state.searchEpoch++;
+    state.searchQuery = "";
     state.searchController?.abort(); state.searchController = null;
     $("search-status").hidden = true;
     $("search-evidence").disabled = state.connectionBlocked || state.disconnected;
@@ -720,21 +750,26 @@
   async function pollRun(epoch) {
     if (epoch !== state.epoch || !state.run || state.streamSupported !== false || state.connectionBlocked) return;
     const runId = state.run.id;
+    const generation = runGeneration(runId); const generations = new Map(state.runGenerations);
     try {
       const refreshProject = state.runs.some((item) => item.id !== runId && activeStatuses.has(item.status));
-      const [run, projectRuns] = await Promise.all([
+      const [response, projectRuns] = await Promise.all([
         api(`/runs/${encodeURIComponent(runId)}`),
         refreshProject ? api(`/runs?project_id=${encodeURIComponent(state.project.id)}`) : Promise.resolve(null),
       ]);
-      if (epoch !== state.epoch || state.run?.id !== runId || state.streamSupported !== false) return;
+      if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId || state.streamSupported !== false) return;
       const previousStatus = state.run.status;
+      if (projectRuns) {
+        collection(projectRuns, "runs").forEach((item) => { if (runGeneration(item.id) === (generations.get(item.id) || 0)) updateRunList(item); });
+        state.runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      }
+      const run = updateRunList(response);
       const selectedChanged = state.run.updated_at !== run.updated_at || previousStatus !== run.status;
-      if (projectRuns) state.runs = collection(projectRuns, "runs").sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      state.run = run; updateRunList(run);
+      state.run = run;
       renderRun(!selectedChanged);
       if (selectedChanged && run.report && !$("evidence-query").value.trim()) renderEvidence();
       await loadEvents(runId, epoch);
-      if (epoch !== state.epoch || state.run?.id !== runId) return;
+      if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId) return;
       state.pollingError = "";
       renderRun(!selectedChanged);
       if (run.status === "completed" && previousStatus !== "completed") {
@@ -744,7 +779,7 @@
       }
       schedulePoll(epoch);
     } catch (error) {
-      if (epoch !== state.epoch) return;
+      if (epoch !== state.epoch || generation !== runGeneration(runId)) return;
       state.pollingError = `进度暂时无法更新：${error.message} 已有任务状态和结果仍保留，4 秒后自动重试。`;
       renderPollingError(); renderExport();
       schedulePoll(epoch);
@@ -754,18 +789,19 @@
   async function selectRun(runId) {
     stopTransport();
     const epoch = ++state.epoch;
+    const generation = runGeneration(runId);
     state.events = []; state.eventAfter = 0; state.pollingError = ""; resetSearch();
     $("evidence-query").value = "";
     state.run = state.runs.find((run) => run.id === runId) || null;
     renderRun(); renderEvidence();
     try {
       const run = await api(`/runs/${encodeURIComponent(runId)}`);
-      if (epoch !== state.epoch) return;
-      state.run = run; updateRunList(run);
-      renderRun(); renderEvidence();
+      if (epoch !== state.epoch || generation !== runGeneration(runId)) return;
+      state.run = updateRunList(run);
+      renderRun(); if (!$("evidence-query").value.trim()) renderEvidence();
       syncTransport(epoch);
     } catch (error) {
-      if (epoch === state.epoch) {
+      if (epoch === state.epoch && generation === runGeneration(runId)) {
         state.pollingError = `读取研究详情失败：${error.message} 可点击重试恢复连接。`;
         renderPollingError();
         state.streamTimer = setTimeout(() => syncTransport(epoch), 4000);
@@ -955,17 +991,21 @@
   async function runAction(action) {
     if (!state.run || state.actionBusy || state.connectionBlocked || state.disconnected) return;
     const runId = state.run.id; const projectId = state.project.id; const epoch = state.epoch; const connectionEpoch = state.connectionEpoch;
+    const generation = invalidateRunObservation(runId);
     state.actionBusy = true; renderRun();
     try {
       const run = await api(`/runs/${encodeURIComponent(runId)}/${action}`, { method: "POST" });
-      if (connectionEpoch !== state.connectionEpoch || state.project?.id !== projectId) return;
-      if (run?.id) updateRunList(run);
+      if (connectionEpoch !== state.connectionEpoch || generation !== runGeneration(runId) || state.project?.id !== projectId) return;
+      const current = run?.id ? updateRunList(run) : null;
       if (epoch !== state.epoch || state.run?.id !== runId) { renderRun(true); syncTransport(state.epoch); return; }
-      if (run?.id) state.run = run;
-      syncTransport(epoch, action === "resume");
+      if (current) state.run = current;
+      syncTransport(epoch, true);
       toast(action === "cancel" ? "已提交取消请求。" : "研究已恢复。");
     } catch (error) { if (connectionEpoch === state.connectionEpoch && epoch === state.epoch) showError(error.message); }
-    finally { state.actionBusy = false; renderRun(); }
+    finally {
+      state.actionBusy = false; renderRun();
+      if (connectionEpoch === state.connectionEpoch && generation === runGeneration(runId) && epoch === state.epoch && state.run?.id === runId && !state.streamController && !state.streamTimer) syncTransport(epoch);
+    }
   }
 
   async function searchEvidence() {
@@ -974,6 +1014,7 @@
     resetSearch();
     const searchEpoch = state.searchEpoch; const projectId = state.project.id; const connectionEpoch = state.connectionEpoch;
     if (!query) { renderEvidence(); return; }
+    state.searchQuery = query;
     const controller = new AbortController(); state.searchController = controller;
     $("search-evidence").disabled = true;
     $("search-status").hidden = false;
@@ -1587,7 +1628,14 @@
   });
   $("search-evidence").addEventListener("click", searchEvidence);
   $("evidence-query").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchEvidence(); } });
-  $("evidence-query").addEventListener("input", () => { if (!$("evidence-query").value.trim()) { resetSearch(); renderEvidence(); } });
+  $("evidence-query").addEventListener("input", () => {
+    const query = $("evidence-query").value.trim();
+    if (query && query === state.searchQuery) return;
+    resetSearch();
+    if (!query) { renderEvidence(); return; }
+    $("search-status").hidden = false; $("search-status").textContent = "关键词已修改，点击「搜索」或按 Enter 查看匹配证据。";
+    empty($("evidence-content"), "等待搜索新关键词", "点击「搜索」或按 Enter，不会继续显示上一个关键词的结果。", "◎");
+  });
   $("open-settings").addEventListener("click", () => { $("api-token").value = token(); $("settings-dialog").showModal(); });
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();

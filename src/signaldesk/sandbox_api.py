@@ -1,12 +1,12 @@
 """Bearer-authenticated, project-scoped asynchronous Docker execution HTTP API."""
 
-import secrets
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
+from signaldesk.auth import authenticate_bearer
 from signaldesk.config import Settings
 from signaldesk.history import HistoryCursorError, HistoryPage
 from signaldesk.repository import Repository
@@ -37,16 +37,11 @@ def create_sandbox_router(
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ):
-        if settings.api_token and (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not secrets.compare_digest(credentials.credentials, settings.api_token)
-        ):
-            raise HTTPException(
-                401,
-                "需要有效的 Bearer API token。",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        authenticate_bearer(
+            settings.api_token,
+            credentials.scheme if credentials else "",
+            credentials.credentials if credentials else "",
+        )
 
     router = APIRouter(prefix="/api/projects", dependencies=[Depends(authenticate)])
 

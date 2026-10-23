@@ -1,6 +1,5 @@
 """HTTP routes. Progress is exposed as cursor-based JSON event polling."""
 
-import secrets
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -8,10 +7,16 @@ from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from signaldesk import __version__
+from signaldesk.auth import authenticate_bearer
 from signaldesk.config import Settings
 from signaldesk.exports import ExportUnavailable, attachment_filename, export_json, export_markdown
 from signaldesk.jobs import JobManager
-from signaldesk.repository import ActiveRunError, Repository, RunConfigurationError
+from signaldesk.repository import (
+    MAX_EVENT_CURSOR,
+    ActiveRunError,
+    Repository,
+    RunConfigurationError,
+)
 from signaldesk.schemas import EventRead, ProjectCreate, ProjectRead, RunCreate, RunRead
 
 
@@ -22,18 +27,11 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ) -> None:
-        if not settings.api_token:
-            return
-        if (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not secrets.compare_digest(credentials.credentials, settings.api_token)
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="需要有效的 Bearer API token。",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        authenticate_bearer(
+            settings.api_token,
+            credentials.scheme if credentials else "",
+            credentials.credentials if credentials else "",
+        )
 
     protected = APIRouter(dependencies=[Depends(authenticate)])
 
@@ -200,7 +198,7 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
         )
 
     @protected.get("/runs/{run_id}/events", response_model=list[EventRead])
-    async def get_events(run_id: str, after: int = Query(default=0, ge=0)):
+    async def get_events(run_id: str, after: int = Query(default=0, ge=0, le=MAX_EVENT_CURSOR)):
         await require_run(run_id)
         return await repo.list_events(run_id, after)
 

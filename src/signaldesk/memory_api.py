@@ -1,6 +1,5 @@
 """Authenticated user-only preference editing; namespaces never come from HTTP."""
 
-import secrets
 from typing import Annotated
 from urllib.parse import unquote_to_bytes
 
@@ -8,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+from signaldesk.auth import authenticate_bearer
 from signaldesk.config import Settings
 from signaldesk.memory import MemoryLimitError, MemoryValidationError, ProjectMemory
 from signaldesk.repository import Repository
@@ -25,14 +25,11 @@ def create_memory_router(
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ):
-        if settings.api_token and (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not secrets.compare_digest(credentials.credentials, settings.api_token)
-        ):
-            raise HTTPException(
-                401, "需要有效的 Bearer API token。", headers={"WWW-Authenticate": "Bearer"}
-            )
+        authenticate_bearer(
+            settings.api_token,
+            credentials.scheme if credentials else "",
+            credentials.credentials if credentials else "",
+        )
 
     router = APIRouter(prefix="/api/projects", dependencies=[Depends(authenticate)])
 

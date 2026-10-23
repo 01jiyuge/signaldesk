@@ -5,7 +5,6 @@ no second worker, model, arbitrary instruction executor, or project ACL exists.
 """
 
 import asyncio
-import secrets
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -46,6 +45,7 @@ from starlette.responses import JSONResponse
 
 from signaldesk import __version__
 from signaldesk.a2a_store import A2ARequestStore, IdempotencyConflict
+from signaldesk.auth import authenticate_bearer
 from signaldesk.repository import ActiveRunError
 from signaldesk.schemas import RunCreate
 
@@ -61,15 +61,8 @@ class A2ACommand(BaseModel):
 
 
 def authenticate_a2a(request: Request, settings) -> None:
-    token = settings.api_token
-    if token:
-        scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(
-            supplied.encode(), token.encode()
-        ):
-            raise HTTPException(
-                401, "需要有效的 Bearer API token。", headers={"WWW-Authenticate": "Bearer"}
-            )
+    scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+    authenticate_bearer(settings.api_token, scheme, supplied)
 
 
 def validate_endpoint(url: str) -> str:

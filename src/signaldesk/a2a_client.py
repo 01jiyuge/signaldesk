@@ -30,6 +30,7 @@ MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
 SEND_ACK_GRACE_SECONDS = 5
 REMOTE_CANCEL_GRACE_SECONDS = 5
 SEND_DRAIN_GRACE_SECONDS = 5
+CLIENT_CLOSE_GRACE_SECONDS = 5
 
 
 class BoundedResponseStream(httpx.AsyncByteStream):
@@ -93,8 +94,62 @@ class A2ADelegate:
         self.repo = repo
         self.bindings = A2ARequestStore(repo)
 
+    @staticmethod
+    async def _close_owned(close):
+        async def finish():
+            # A network deadline must not interrupt HTTPX halfway through close.
+            # The independent grace cancels and joins cooperative close work.
+            async with asyncio.timeout(CLIENT_CLOSE_GRACE_SECONDS):
+                await close()
+
+        operation = asyncio.create_task(finish(), name="a2a-client-close")
+        cancelled = False
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            if not operation.cancelled():
+                operation.exception()
+            raise asyncio.CancelledError
+        try:
+            operation.result()
+        except TimeoutError as exc:
+            raise PublicTaskError(
+                "远端 A2A 连接关闭超过清理时间限制；请核对已登记委托状态。",
+                code="a2a_timeout",
+                retryable=True,
+            ) from exc
+
+    @asynccontextmanager
+    async def _http_client(self, **kwargs):
+        client = httpx.AsyncClient(**kwargs)
+        try:
+            yield client
+        finally:
+            await self._close_owned(client.aclose)
+
     @asynccontextmanager
     async def _client(self, remote: str):
+        try:
+            # HTTPX's timeout bounds inactivity for each read. A single remote
+            # operation must also finish when the peer keeps trickling bytes.
+            async with asyncio.timeout(getattr(self.settings, "a2a_timeout_seconds", 180)):
+                async with self._connected_client(remote) as client:
+                    yield client
+        except TimeoutError as exc:
+            raise PublicTaskError(
+                "远端 A2A 调用超过本次时间限制；请核对已登记委托状态。",
+                code="a2a_timeout",
+                retryable=True,
+                suggestion="检查远端服务和网络；使用原 message_id 核对登记，不要创建重复委托。",
+            ) from exc
+
+    @asynccontextmanager
+    async def _connected_client(self, remote: str):
         remotes = getattr(self.settings, "a2a_remote_agents", {})
         if remote not in remotes:
             raise PublicTaskError(
@@ -108,7 +163,7 @@ class A2ADelegate:
             headers = {"Accept-Encoding": "identity"}
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            async with httpx.AsyncClient(
+            async with self._http_client(
                 headers=headers,
                 timeout=getattr(self.settings, "a2a_timeout_seconds", 180),
                 follow_redirects=False,
@@ -144,7 +199,7 @@ class A2ADelegate:
                 try:
                     yield client
                 finally:
-                    await client.close()
+                    await self._close_owned(client.close)
         except PublicTaskError:
             raise
         except TaskNotFoundError as exc:
@@ -169,6 +224,31 @@ class A2ADelegate:
                 code="a2a_project_mismatch",
                 suggestion="检查远端项目 ID 与任务 ID 的对应关系。",
             )
+
+    async def _record_task_owned(self, delegation_id, task, *, acknowledge=None):
+        # Receiving a task is not a durable ACK until record_task commits. A
+        # deadline or disconnected caller must join this one write, even when
+        # cancellation arrives repeatedly, before the repository can close.
+        operation = asyncio.create_task(
+            self.bindings.record_task(delegation_id, task),
+            name=f"a2a-record-{delegation_id}",
+        )
+        cancelled = False
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled and (operation.cancelled() or operation.exception() is not None):
+            raise asyncio.CancelledError
+        result = self._public(operation.result())
+        if acknowledge is not None:
+            acknowledge(result)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     @staticmethod
     def _public(record):
@@ -290,6 +370,14 @@ class A2ADelegate:
             ),
             configuration=SendMessageConfiguration(return_immediately=True),
         )
+        confirmed = None
+
+        def acknowledge(result):
+            nonlocal confirmed
+            confirmed = result
+            if _acknowledged is not None and not _acknowledged.done():
+                _acknowledged.set_result(result)
+
         try:
             async with self._client(remote) as client:
                 async for response in client.send_message(request):
@@ -297,24 +385,37 @@ class A2ADelegate:
                         raise ValueError("Remote response did not contain a task")
                     self._check_project(response.task, remote_project_id)
                     task = MessageToDict(response.task)
-                    accepted = await self.bindings.record_task(record["id"], task)
-                    result = self._public(accepted)
-                    if _acknowledged is not None and not _acknowledged.done():
-                        _acknowledged.set_result(result)
-                    return result
+                    return await self._record_task_owned(
+                        record["id"], task, acknowledge=acknowledge
+                    )
                 raise ValueError("Remote did not return a task")
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, PublicTaskError) and exc.code == "a2a_timeout" and confirmed:
+                # A completed ACK write remains successful if the enclosing
+                # deadline expired during that write or HTTP-client closure.
+                return confirmed
             _send_gate.failed = True
             raise
 
     async def get(self, delegation_id: str) -> dict:
         record = await self._registered(delegation_id)
-        async with self._client(record["remote"]) as client:
-            task = await client.get_task(GetTaskRequest(id=record["task"]["id"]))
-            self._check_project(task, record["remote_project_id"])
-            data = MessageToDict(task)
-            accepted = await self.bindings.record_task(record["id"], data)
-            return self._public(accepted)
+        confirmed = None
+
+        def acknowledge(result):
+            nonlocal confirmed
+            confirmed = result
+
+        try:
+            async with self._client(record["remote"]) as client:
+                task = await client.get_task(GetTaskRequest(id=record["task"]["id"]))
+                self._check_project(task, record["remote_project_id"])
+                return await self._record_task_owned(
+                    record["id"], MessageToDict(task), acknowledge=acknowledge
+                )
+        except PublicTaskError as exc:
+            if exc.code == "a2a_timeout" and confirmed:
+                return confirmed
+            raise
 
     async def list(self, project_id: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
         return [
@@ -339,25 +440,43 @@ class A2ADelegate:
     async def cancel(self, delegation_id: str) -> dict:
         record = await self._registered(delegation_id)
         task_id = record["task"]["id"]
-        async with self._client(record["remote"]) as client:
-            current = await client.get_task(GetTaskRequest(id=task_id))
-            self._check_project(current, record["remote_project_id"])
-            accepted = await self.bindings.record_task(record["id"], MessageToDict(current))
-            state = accepted["status"]
-            if state == "TASK_STATE_CANCELED":
-                return self._public(accepted)
-            if state in TERMINAL_TASK_STATES:
-                raise TaskNotCancelableError()
-            task = await client.cancel_task(CancelTaskRequest(id=task_id))
-            self._check_project(task, record["remote_project_id"])
-            data = MessageToDict(task)
-            accepted = await self.bindings.record_task(record["id"], data)
+        confirmed = None
+
+        def acknowledge(result):
+            nonlocal confirmed
+            confirmed = result
+
+        try:
+            async with self._client(record["remote"]) as client:
+                current = await client.get_task(GetTaskRequest(id=task_id))
+                self._check_project(current, record["remote_project_id"])
+                accepted = await self._record_task_owned(
+                    record["id"], MessageToDict(current), acknowledge=acknowledge
+                )
+                state = accepted["status"]
+                if state == "TASK_STATE_CANCELED":
+                    return accepted
+                if state in TERMINAL_TASK_STATES:
+                    raise TaskNotCancelableError()
+                task = await client.cancel_task(CancelTaskRequest(id=task_id))
+                self._check_project(task, record["remote_project_id"])
+                accepted = await self._record_task_owned(
+                    record["id"], MessageToDict(task), acknowledge=acknowledge
+                )
+                if (
+                    accepted["status"] in TERMINAL_TASK_STATES
+                    and accepted["status"] != "TASK_STATE_CANCELED"
+                ):
+                    raise TaskNotCancelableError()
+                return accepted
+        except PublicTaskError as exc:
             if (
-                accepted["status"] in TERMINAL_TASK_STATES
-                and accepted["status"] != "TASK_STATE_CANCELED"
+                exc.code == "a2a_timeout"
+                and confirmed
+                and confirmed["status"] == "TASK_STATE_CANCELED"
             ):
-                raise TaskNotCancelableError()
-            return self._public(accepted)
+                return confirmed
+            raise
 
     async def delegate_wait(
         self,

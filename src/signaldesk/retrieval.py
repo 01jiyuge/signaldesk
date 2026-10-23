@@ -25,6 +25,10 @@ LATEST = """SELECT s.*, row_number() OVER (
 def _snapshot(row) -> SnapshotRecord:
     data = dict(row)
     value = data["created_at"]
+    if isinstance(value, str):
+        # SQLite text() queries return naive UTC strings, unlike ORM rows and
+        # PostgreSQL. Preserve the instant when browsers use their local zone.
+        value = datetime.fromisoformat(value)
     if isinstance(value, datetime):
         value = value.replace(tzinfo=UTC) if value.tzinfo is None else value
         data["created_at"] = value.isoformat()
@@ -155,6 +159,37 @@ class Retriever:
                         "embedding": json.dumps(vector),
                     },
                 )
+
+    async def backfill_missing_snapshots(self, snapshots: list[SnapshotRecord]) -> None:
+        """Index current sources only when no reusable successful vector exists.
+
+        Vector search may be enabled after a project's baseline was collected.
+        An unchanged body still needs its first embedding. Exact snapshot ids
+        also make a retry after a committed indexing write avoid another call.
+        """
+        if self.embeddings is None or not snapshots:
+            return
+        missing = []
+        async with self.repo.engine.connect() as conn:
+            for snapshot in snapshots:
+                exists = await conn.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM evidence_embeddings e "
+                        "JOIN snapshots s ON s.id=e.snapshot_id JOIN runs r ON r.id=s.run_id "
+                        "WHERE e.project_id=:project_id AND s.project_id=:project_id "
+                        "AND s.url=:url AND s.content_hash=:hash "
+                        "AND (r.status='completed' OR s.id=:id))"
+                    ),
+                    {
+                        "project_id": snapshot.project_id,
+                        "url": snapshot.url,
+                        "hash": snapshot.content_hash,
+                        "id": snapshot.id,
+                    },
+                )
+                if not exists:
+                    missing.append(snapshot)
+        await self.index_snapshots(missing)
 
     async def _fulltext(self, project_id: str, query: str, limit: int) -> list[SnapshotRecord]:
         if not self.fulltext_ready:

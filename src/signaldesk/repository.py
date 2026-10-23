@@ -23,6 +23,9 @@ from signaldesk.schemas import (
     SnapshotRecord,
 )
 
+# Event.id uses Integer: PostgreSQL's signed int32 is the portable cursor range.
+MAX_EVENT_CURSOR = 2**31 - 1
+
 
 class ActiveRunError(ValueError):
     """A project already has an active research run."""
@@ -103,7 +106,7 @@ class Repository:
                 cursor.close()
 
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
-        self._project_locks: dict[str, asyncio.Lock] = {}
+        self._project_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
     async def initialize(self) -> None:
         if self.engine.dialect.name == "sqlite":
@@ -144,19 +147,27 @@ class Repository:
     @asynccontextmanager
     async def _locked_project_session(self, project_id: str):
         """Serialize project edits and run transitions in Python and the database."""
-        lock = self._project_locks.setdefault(project_id, asyncio.Lock())
-        async with lock:
-            async with self.sessions.begin() as session:
-                if self.engine.dialect.name == "sqlite":
-                    # SQLite has no FOR UPDATE. Acquire its writer reservation
-                    # before the active-run read, including across processes.
-                    await session.execute(text("BEGIN IMMEDIATE"))
-                project = await session.scalar(
-                    select(Project).where(Project.id == project_id).with_for_update()
-                )
-                if project is None:
-                    raise KeyError(project_id)
-                yield session, project
+        lock, participants = self._project_locks.get(project_id, (asyncio.Lock(), 0))
+        self._project_locks[project_id] = (lock, participants + 1)
+        try:
+            async with lock:
+                async with self.sessions.begin() as session:
+                    if self.engine.dialect.name == "sqlite":
+                        # SQLite has no FOR UPDATE. Acquire its writer reservation
+                        # before the active-run read, including across processes.
+                        await session.execute(text("BEGIN IMMEDIATE"))
+                    project = await session.scalar(
+                        select(Project).where(Project.id == project_id).with_for_update()
+                    )
+                    if project is None:
+                        raise KeyError(project_id)
+                    yield session, project
+        finally:
+            _, participants = self._project_locks[project_id]
+            if participants == 1:
+                del self._project_locks[project_id]
+            else:
+                self._project_locks[project_id] = (lock, participants - 1)
 
     async def update_project(self, project_id: str, payload: ProjectCreate) -> ProjectRead:
         async with self._locked_project_session(project_id) as (session, project):

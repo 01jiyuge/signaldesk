@@ -26,7 +26,17 @@ class CitationError(ValueError):
 
 def verify_report(report: ResearchReport, evidence: list[Evidence]) -> None:
     """Validate provenance mechanics, not truth, entailment, or business impact."""
+    try:
+        json.dumps(
+            [report.model_dump(), [item.model_dump() for item in evidence]],
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise CitationError("报告包含无法安全保存或展示的文本或数值。") from exc
     indexed = {item.id: item for item in evidence}
+    if len(indexed) != len(evidence):
+        raise CitationError("报告证据 ID 不可重复。")
     for finding in report.findings:
         if not finding.citations:
             raise CitationError("每项发现都需要原文引用。")

@@ -170,6 +170,139 @@ class ScriptedEmbeddings:
         return [1.0, 0.0, 0.0]
 
 
+async def test_postgres_unchanged_live_run_backfills_missing_vectors_once(
+    postgres_schema, monkeypatch
+):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from signaldesk.workflow import Workflow
+
+    repo, settings, _, retrievers = postgres_schema
+    own = await repo.create_project(
+        ProjectCreate(
+            name="Enable vectors later",
+            sources=[{"name": "Pricing", "url": "https://fixture.example/pricing"}],
+        )
+    )
+    baseline = await repo.create_run(own.id, RunCreate(mode="live"))
+    body = "Current pricing body"
+    old = SnapshotRecord(
+        id="before-vector-enabled",
+        run_id=baseline.id,
+        project_id=own.id,
+        source_name="Pricing",
+        url=str(own.sources[0].url),
+        title="Pricing",
+        text=body,
+        content_hash=content_hash(body),
+        created_at="2026-01-01T00:00:00Z",
+    )
+    await repo.save_snapshot(old)
+    await repo.update_run(baseline.id, status="completed")
+    provider = ScriptedEmbeddings()
+    monkeypatch.setattr("signaldesk.retrieval.OpenAIEmbeddings", lambda **kwargs: provider)
+    settings = settings.model_copy(
+        update={"enable_vector_search": True, "model": "openai:fixture-not-called"}
+    )
+    retriever = Retriever(repo, settings)
+    retrievers.append(retriever)
+    await retriever.initialize()
+
+    async def local_fetch(url, config):
+        return "Pricing", body
+
+    async def forbidden_model(*args, **kwargs):
+        raise AssertionError("Unchanged sources must not invoke the research model")
+
+    monkeypatch.setattr("signaldesk.workflow.fetch_page", local_fetch)
+    workflow = Workflow(repo, settings, InMemorySaver(), retriever)
+    monkeypatch.setattr(workflow.research, "generate", forbidden_model)
+    for number in range(2):
+        run = await repo.create_run(own.id, RunCreate(mode="live"))
+        await workflow.run(run.id)
+        result = await repo.get_run(run.id)
+        assert result.status == "completed"
+        assert result.report["stats"]["model_call_skipped"]
+        assert result.report["stats"]["unchanged_sources"] == 1
+        hits = await retriever.search(own.id, "vector_only_without_lexical_overlap")
+        current = (await repo.get_snapshots(run.id))[0]
+        assert [hit.evidence_id for hit in hits] == [current.id]
+        assert hits[0].retrieval_methods == ["vector"]
+        assert len(provider.document_batches) == 1
+        assert number == 0 or current.id != old.id
+
+
+async def test_postgres_persist_retry_reuses_committed_baseline_embedding(
+    postgres_schema, monkeypatch
+):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from signaldesk.schemas import Evidence, ResearchReport
+    from signaldesk.workflow import Workflow
+
+    repo, settings, _, retrievers = postgres_schema
+    settings = settings.model_copy(update={"enable_vector_search": True})
+    provider = ScriptedEmbeddings()
+    monkeypatch.setattr("signaldesk.retrieval.OpenAIEmbeddings", lambda **kwargs: provider)
+    retriever = Retriever(repo, settings)
+    retrievers.append(retriever)
+    await retriever.initialize()
+    own = await project(repo, "Retry indexing")
+    run = await repo.create_run(own.id, RunCreate(mode="live"))
+    snapshot = SnapshotRecord(
+        id="committed-vector-before-report",
+        run_id=run.id,
+        project_id=own.id,
+        source_name="Pricing",
+        url=str(own.sources[0].url),
+        title="Pricing",
+        text="Current body",
+        content_hash=content_hash("Current body"),
+        created_at="2026-01-01T00:00:00Z",
+    )
+    await repo.save_snapshot(snapshot)
+    workflow = Workflow(repo, settings, InMemorySaver(), retriever)
+    state = {
+        "run_id": run.id,
+        "snapshots": [snapshot.model_dump()],
+        "evidence": [
+            Evidence(
+                id=snapshot.id,
+                source_name=snapshot.source_name,
+                url=snapshot.url,
+                title=snapshot.title,
+                text=snapshot.text,
+                change_type="baseline",
+            ).model_dump()
+        ],
+        "report": ResearchReport(
+            title="Retry fixture",
+            summary="Local fixture",
+            findings=[],
+            recommendations=[],
+            limitations=[],
+        ).model_dump(),
+    }
+    original_update = repo.update_run
+    fail_once = True
+
+    async def fail_after_embedding(run_id, **fields):
+        nonlocal fail_once
+        if fields.get("report") and fail_once:
+            fail_once = False
+            raise RuntimeError("Fixture: report commit failed after vector commit")
+        return await original_update(run_id, **fields)
+
+    monkeypatch.setattr(repo, "update_run", fail_after_embedding)
+    with pytest.raises(RuntimeError, match="report commit failed"):
+        await workflow._persist(state)
+    assert len(provider.document_batches) == 1
+    assert (await repo.get_run(run.id)).report is None
+    await workflow._persist(state)
+    assert (await repo.get_run(run.id)).status == "completed"
+    assert len(provider.document_batches) == 1
+
+
 async def test_postgres_vector_reuses_same_hash_for_latest_snapshot_and_excludes_old_hash(
     postgres_schema,
     monkeypatch,

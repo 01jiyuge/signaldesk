@@ -7,7 +7,6 @@ runner, and closing a subscriber never cancels the underlying research task.
 import asyncio
 import json
 import re
-import secrets
 import time
 from collections.abc import AsyncIterator
 from typing import Annotated
@@ -27,14 +26,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from signaldesk.auth import authenticate_bearer
 from signaldesk.config import Settings
-from signaldesk.repository import Repository
+from signaldesk.repository import MAX_EVENT_CURSOR, Repository
 from signaldesk.schemas import EventRead, RunRead
 
 POLL_INTERVAL_SECONDS = 0.25
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024 - 4096
-MAX_CURSOR = 2**53 - 1
+MAX_CURSOR = MAX_EVENT_CURSOR
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 STAGE_MESSAGES = {
     "queued": "任务正在等待执行。",
@@ -271,14 +271,11 @@ def create_agui_router(repo: Repository, settings: Settings) -> APIRouter:
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ):
-        if settings.api_token and (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not secrets.compare_digest(credentials.credentials, settings.api_token)
-        ):
-            raise HTTPException(
-                401, "需要有效的 Bearer API token。", headers={"WWW-Authenticate": "Bearer"}
-            )
+        authenticate_bearer(
+            settings.api_token,
+            credentials.scheme if credentials else "",
+            credentials.credentials if credentials else "",
+        )
 
     router = APIRouter(prefix="/api/runs", dependencies=[Depends(authenticate)])
 

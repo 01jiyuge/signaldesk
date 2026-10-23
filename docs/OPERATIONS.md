@@ -1,6 +1,6 @@
 # 启动、配置与验证
 
-更新：2026-10-23。当前 V0.4.3 为本地单用户、单进程可运行版本；历史分页和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)。 本轮采集、检索与接口交互升级见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。
+更新：2026-10-23。当前 V0.4.4 为本地单用户、单进程可运行版本；历史分页和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。本轮状态、索引与协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)，验收结果见该文档。
 
 ## 1. 本地启动
 
@@ -102,7 +102,10 @@ EMBEDDING_DIMENSIONS=1536
 ```
 
 需要提供商支持配置的 dimensions 参数、有效 `OPENAI_API_KEY`，以及数据库 vector 扩展权限。
-应用创建 `evidence_embeddings` 表；只为真实任务中首次或发生变化的来源建立向量，嵌入和查询会产生服务费用。
+应用创建 `evidence_embeddings` 表；为真实任务中首次、发生变化或缺少可复用向量的未变化来源建立向量，嵌入和查询会产生服务费用。
+先关闭、后启用向量检索时，下一次 live 运行会补齐本次来源缺失的向量；相同项目、URL 和正文 hash 已有向量时复用。
+来源和研究上下文均未变化时，补向量只调用嵌入服务，不触发研究模型；这不是全部旧历史的离线重建，也不负责模型或维度迁移。
+全部当前 live 快照共用缺失检查；本次相同快照的嵌入已提交、报告保存失败时，恢复可复用该向量。复用其他运行的向量仍要求它已完成，并匹配项目、URL 和正文 hash。
 默认开启 `ENABLE_FULLTEXT_SEARCH=true`：PostgreSQL 使用 simple 全文检索与 GIN 索引，SQLite 使用 FTS5。
 词法、全文和可选向量候选按 RRF 融合。默认 `RERANKER_PROVIDER=lexical` 是确定性基线，
 不是神经重排模型；设为 none 可直接保留 RRF 顺序。中文分词与大规模性能尚未专项评测。
@@ -159,6 +162,7 @@ MCP_ALLOWED_TOOLS=["search_documents"]
 ## 6. 认证与追踪
 
 配置 `API_TOKEN` 后，除健康检查外的业务 API 要求 `Authorization: Bearer ...`。
+请使用随机 ASCII Token；异常或非 ASCII 凭据统一返回 401，未配置 Token 的本地访问方式保持不变。
 控制台可在本次浏览器会话中填写 Token。静态资源和 API 文档不受 Token 保护，但不包含业务数据。
 这属于单用户共享 Token 机制，不是团队权限或多租户系统。
 
@@ -180,7 +184,7 @@ uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
 node --check src/signaldesk/static/app.js
-node --test tests/frontend_history.mjs tests/frontend_connection.mjs
+node --test tests/frontend_history.mjs tests/frontend_connection.mjs tests/frontend_run_races.mjs
 uv lock --check
 uv run signaldesk-eval --output data/evaluation.json
 ```
@@ -189,7 +193,7 @@ uv run signaldesk-eval --output data/evaluation.json
 来源限制、引用拒绝、Deep Agents 实图与脚本模型、Skills 读取、只读 MCP 以及项目历史隔离。
 脚本模型只用于验证真实框架的调用接口，不代表真实模型效果。
 
-完整 Python 回归344项通过，前端行为测试12项通过。实际PostgreSQL测试7项、实际Docker测试3项，其中一项PG测试结合Docker；按环境变量明确启用，缺少条件会跳过。
+以下保留 V0.4.3 验证历史：完整 Python 回归344项通过，前端行为测试12项通过。实际PostgreSQL测试7项、实际Docker测试3项，其中一项PG测试结合Docker；按环境变量明确启用，缺少条件会跳过。V0.4.4 完整回归427项通过，前端19项通过；真实PostgreSQL测试9项、Docker测试3项，详情见 [升级说明](./V0.4.4_UPGRADE.md)。
 实际数据库测试覆盖 GIN 全文、向量、Store、checkpointer 和应用整体；嵌入输入是确定性夹具，不调用供应商。
 Chrome 已验证 SSE 续传、项目切换、记忆 CRUD 和服务重启持久化。
 
@@ -222,6 +226,7 @@ uv run signaldesk-eval --langsmith --output data/evaluation-langsmith.json
 ## 9. AG-UI 与能力状态
 
 任务创建保持原 REST API；订阅 `GET /api/runs/{run_id}/ag-ui?after=0`，Content-Type 为 text/event-stream。
+JSON 事件接口的 `after`、AG-UI 的 `after` 与 `Last-Event-ID` 均使用 0–2147483647 的数据库事件游标范围，非法或越界输入返回 422。
 配置 token 后需发送 Bearer，原生 EventSource 不能设请求头，前端使用 fetch 流并支持 AbortController。
 `GET /api/capabilities` 可查看本实例 Store、全文、向量与 Reranker 状态，不做付费外部探测。
 断开订阅不取消任务；后台任务取消需专门调用 cancel。当前不是通用 AG-UI RunAgentInput 执行端点。
