@@ -15,6 +15,7 @@
   let memoryBusy = false;
   let memoryController = null;
   let memoryFormEpoch = 0;
+  Object.assign(state, { history: null, selectedRunId: null, detailLoading: false, detailError: "", detailController: null });
   const extensions = { capabilities: null, capabilityError: "", loading: false, capabilityEpoch: 0, context: null, submissions: new Map() };
   const sandboxActive = new Set(["queued", "running", "pending", "cancelling", "canceling"]);
   const delegationActive = new Set(["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"]);
@@ -39,7 +40,7 @@
 
   function renderConnectionControls() {
     const blocked = state.connectionBlocked || state.disconnected;
-    $("submit-project").disabled = blocked || state.actionBusy;
+    $("submit-project").disabled = blocked || state.actionBusy || (!!state.editProjectId && (projectActive() || activityBlocked() || state.runsLoading));
     $("save-memory").disabled = blocked || memoryBusy;
     $("search-evidence").disabled = blocked || !!state.searchController;
     document.querySelectorAll('[data-write-action="memory-delete"]').forEach((button) => { button.disabled = blocked || memoryBusy; });
@@ -128,7 +129,9 @@
   function evidence() { return Array.isArray(state.run?.report?.evidence) ? state.run.report.evidence : []; }
   function currentEvidence(report = state.run?.report) { return (Array.isArray(report?.evidence) ? report.evidence : []).filter((item) => !item.is_previous); }
   function isActive() { return !!state.run && activeStatuses.has(state.run.status); }
-  function projectActive() { return state.runs.some((run) => activeStatuses.has(run.status)); }
+  function projectActive() { return state.history ? !!state.history.activeId : state.runs.some((run) => activeStatuses.has(run.status)); }
+  function activityBlocked() { return !!state.history && (!state.history.activityKnown || !!state.history.activityError); }
+  function observedProjectRuns() { return state.history ? state.runs.filter((run) => run.id === state.history.activeId) : state.runs; }
 
   function reportResult(report = state.run?.report) {
     const current = currentEvidence(report);
@@ -198,11 +201,12 @@
     $("demo-notice").hidden = !demo;
     $("live-config-notice").hidden = demo || state.health?.live_configured !== false;
     $("run-mode-hint").textContent = demo ? "内置虚构样本 · 无需模型 Key" : state.health?.live_configured ? "真实来源 · 使用服务端模型配置" : "真实调研未配置：请在服务端配置模型 Key";
-    $("start-run").disabled = state.actionBusy || projectActive() || state.runsLoading || state.connectionBlocked || state.disconnected || (!demo && state.health?.live_configured === false);
+    $("start-run").disabled = state.actionBusy || projectActive() || activityBlocked() || state.runsLoading || state.connectionBlocked || state.disconnected || (!demo && state.health?.live_configured === false);
     $("start-run").title = !demo && state.health?.live_configured === false ? "请先配置服务端模型环境变量，再重新连接服务" : "";
-    $("edit-project").disabled = state.actionBusy || projectActive() || state.runsLoading || state.connectionBlocked || state.disconnected;
-    $("edit-project").title = projectActive() ? "项目有等待或执行中的任务，结束后可编辑；已有历史会保留" : state.runsLoading ? "正在读取任务状态" : "编辑项目、关注来源与研究重点";
-    $("edit-lock-note").hidden = !projectActive();
+    $("edit-project").disabled = state.actionBusy || projectActive() || activityBlocked() || state.runsLoading || state.connectionBlocked || state.disconnected;
+    $("edit-project").title = projectActive() ? "项目有等待或执行中的任务，结束后可编辑；已有历史会保留" : activityBlocked() || state.runsLoading ? "项目活动状态尚未确认，请刷新运行历史后重试" : "编辑项目、关注来源与研究重点";
+    $("edit-lock-note").hidden = !projectActive() && !activityBlocked();
+    $("edit-lock-note").textContent = activityBlocked() ? "项目活动状态尚未确认，暂时禁用编辑和启动研究。请刷新运行历史；已有后台任务继续执行。" : "项目有等待或执行中的任务，暂时无法编辑。任务结束后可调整来源，历史快照与报告会保留。";
     renderConnectionControls();
   }
 
@@ -285,6 +289,7 @@
   function runGeneration(runId) { return state.runGenerations.get(runId) || 0; }
 
   function invalidateRunObservation(runId) {
+    if (state.history) state.history.activityVersion++;
     const generation = runGeneration(runId) + 1; state.runGenerations.set(runId, generation);
     if (state.run?.id === runId) {
       stopPolling(); state.streamController?.abort(); state.streamController = null;
@@ -295,22 +300,38 @@
     return generation;
   }
 
-  function updateRunList(run) {
+  function updateRunList(run, activity = true) {
     const index = state.runs.findIndex((item) => item.id === run.id);
     if (index >= 0 && compareRunTime(state.runs[index].updated_at, run.updated_at) > 0) return state.runs[index];
-    if (index === -1) state.runs.unshift(run); else state.runs[index] = run;
-    return run;
+    const merged = { ...(index >= 0 ? state.runs[index] : {}), ...run };
+    if (index === -1) state.runs.unshift(merged); else state.runs[index] = merged;
+    const history = state.history;
+    if (activity && history && (activeStatuses.has(merged.status) || history.activeId === merged.id)) {
+      history.activityVersion++; history.activeId = activeStatuses.has(merged.status) ? merged.id : null;
+      history.activityKnown = true; history.activityError = "";
+    }
+    return merged;
+  }
+
+  function historyRuns() {
+    const history = state.history;
+    if (!history) return state.runs;
+    const pins = [state.selectedRunId, history.activeId].filter((id) => id && !history.ids.includes(id));
+    const ids = [...new Set([...pins, ...history.ids])];
+    return ids.map((id) => state.runs.find((run) => run.id === id)).filter(Boolean);
   }
 
   function renderRunSelector() {
-    $("metric-runs").textContent = state.runs.length;
-    $("run-selector-wrap").hidden = !state.runs.length;
-    $("run-selector").replaceChildren(...state.runs.map((run) => {
+    const runs = historyRuns(); const history = state.history;
+    $("metric-runs").textContent = history ? history.ids.length : state.runs.length;
+    $("run-selector-wrap").hidden = !runs.length && !state.selectedRunId;
+    const options = runs.map((run) => {
       const option = node("option", "", `${dateTime(run.created_at, true)} · ${run.mode === "demo" ? "演示" : "真实调研"} ${run.report ? reportResult(run.report).label : run.mode === "demo" ? (run.demo_revision === 2 ? "变化版本" : "基线版本") : ""}`);
-      option.value = run.id; option.selected = run.id === state.run?.id; return option;
-    }));
-    const completed = state.runs.filter((item) => item.status === "completed").length;
-    $("metric-runs-note").textContent = completed ? `其中 ${completed} 次已完成` : "项目的研究任务总数";
+      option.value = run.id; option.selected = run.id === (state.selectedRunId || state.run?.id); return option;
+    });
+    if (state.selectedRunId && !runs.some((run) => run.id === state.selectedRunId)) { const option = node("option", "", `当前选择 · ${state.selectedRunId.slice(0, 8)}（详情待加载）`); option.value = state.selectedRunId; option.selected = true; options.unshift(option); }
+    $("run-selector").replaceChildren(...options);
+    $("metric-runs-note").textContent = history ? history.loaded ? `已加载的历史条数${history.hasMore ? " · 更多记录见运行历史" : " · 已到当前分页末尾"}` : "正在读取历史摘要，不代表项目总数" : "当前已加载的研究记录";
   }
 
   function renderProgress() {
@@ -416,6 +437,8 @@
   }
 
   function renderReport() {
+    if (state.detailLoading && !state.run?.report) { empty($("report-content"), "正在读取研究详情", "历史列表只载入摘要，报告与证据会按需读取。", "◎", true); return; }
+    if (state.detailError && !state.run?.report) { empty($("report-content"), "暂时无法读取所选研究", state.detailError, "!"); return; }
     const container = $("report-content");
     const run = state.run;
     const report = run?.report;
@@ -496,12 +519,21 @@
 
   function renderHistory() {
     const container = $("history-content"); container.replaceChildren();
-    if (!state.runs.length) { empty(container, "每一次研究，都会成为下一次的起点", "建立基线后，再运行一次研究，就能对比来源发生的变化。", "◷"); return; }
-    state.runs.forEach((run) => {
+    const history = state.history; const runs = historyRuns();
+    $("run-history-error").textContent = history?.error || ""; $("run-history-error").hidden = !history?.error;
+    $("run-activity-error").textContent = history?.activityError || ""; $("run-activity-error").hidden = !history?.activityError;
+    $("run-history-status").textContent = history ? history.loading ? history.mode === "more" ? "正在加载更多历史…" : "正在读取研究摘要…" : history.loaded ? `已加载 ${history.ids.length} 条历史${history.hasMore ? " · 可继续加载" : " · 已到当前分页末尾"}${runs.some((run) => !history.ids.includes(run.id)) ? " · 另展示页外选中或活动任务" : ""}` : "历史尚未加载，请点击刷新重试。" : "";
+    $("load-more-runs").hidden = !history?.hasMore;
+    $("load-more-runs").disabled = !!history?.loading || state.connectionBlocked || state.disconnected;
+    $("load-more-runs").textContent = history?.mode === "more" && history.error ? "重试加载更多" : "加载更多";
+    $("refresh-runs").disabled = !!history?.loading || state.connectionBlocked || state.disconnected;
+    if (!runs.length) { empty(container, history && !history.loaded ? "研究历史尚未就绪" : "每一次研究，都会成为下一次的起点", history && !history.loaded ? "可刷新历史重试；不会把读取失败视为没有任务。" : "建立基线后，再运行一次研究，就能对比来源发生的变化。", "◷"); return; }
+    runs.forEach((run) => {
       const item = node("article", "history-item"); const details = node("div");
       const result = run.report ? reportResult(run.report) : null;
       const heading = node("h3", "", `${run.mode === "demo" ? "演示" : "真实调研"} · ${result ? result.label : run.mode === "demo" ? (run.demo_revision === 2 ? "变化版本" : "基线版本") : "来源研究"}`);
       heading.append(node("span", `status-badge ${run.status}`, statusNames[run.status] || run.status));
+      if (history && !history.ids.includes(run.id)) heading.append(node("span", "history-pin", run.id === state.selectedRunId ? "页外当前选择" : "页外活动任务"));
       details.append(heading, node("p", "", `${dateTime(run.created_at)} · ${run.id.slice(0, 8)}`));
       const button = node("button", "button button-secondary button-small", run.id === state.run?.id ? "当前研究" : "查看研究 ↗");
       button.type = "button"; button.disabled = run.id === state.run?.id;
@@ -573,6 +605,12 @@
     const cached = state.runs.find((item) => item.id === runId);
     if (cached && compareRunTime(cached.updated_at, payload.updated_at) > 0) return;
     let run = { ...cached, ...payload };
+    if (!selected) {
+      const summary = { ...payload }; delete summary.report;
+      const current = updateRunList(summary);
+      if (state.run?.id === runId) state.run = current;
+      renderRun(true); renderTransport(); return;
+    }
     if (snapshot.reportOmitted && !run.report && cached?.report) run.report = cached.report;
     if (snapshot.reportAvailable && snapshot.reportOmitted && !run.report && run.status === "completed") {
       const complete = await api(`/runs/${encodeURIComponent(runId)}`);
@@ -621,6 +659,8 @@
     if (epoch !== state.epoch || !state.run || state.connectionBlocked) return;
     stopPolling();
     const runId = state.run.id; const projectId = state.project.id;
+    const background = state.backgroundStreams.get(runId);
+    if (background) { background.controller?.abort(); clearTimeout(background.timer); state.backgroundStreams.delete(runId); }
     const generation = runGeneration(runId);
     const controller = new AbortController();
     state.streamController?.abort(); state.streamController = controller;
@@ -669,9 +709,9 @@
   }
 
   function syncBackgroundStreams(epoch) {
-    if (epoch !== state.epoch || state.streamSupported !== true || state.connectionBlocked) return;
-    for (const run of state.runs) {
-      if (run.id === state.run?.id || !activeStatuses.has(run.status) || state.backgroundStreams.has(run.id)) continue;
+    if (epoch !== state.epoch || state.streamSupported === false || state.connectionBlocked) return;
+    for (const run of observedProjectRuns()) {
+      if ((run.id === state.run?.id && !state.detailLoading && !state.detailError) || !activeStatuses.has(run.status) || state.backgroundStreams.has(run.id)) continue;
       const generation = runGeneration(run.id);
       const stream = { controller: null, timer: null, cursor: 0, status: "connecting" };
       state.backgroundStreams.set(run.id, stream);
@@ -681,6 +721,8 @@
         let terminal = false;
         try {
           const response = await streamResponse(run.id, stream.cursor, controller);
+          if (epoch !== state.epoch || controller.signal.aborted || state.backgroundStreams.get(run.id) !== stream) return;
+          state.streamSupported = true;
           stream.status = "connected"; renderTransport();
           await readSSE(response, async (event, cursor) => {
             if (epoch !== state.epoch || generation !== runGeneration(run.id) || state.backgroundStreams.get(run.id) !== stream) return true;
@@ -697,7 +739,12 @@
             if (epoch === state.epoch && state.project?.id === run.project_id) await loadMemory(run.project_id);
           }
         } catch (error) {
-          if (epoch === state.epoch && generation === runGeneration(run.id) && !controller.signal.aborted) {
+          if (epoch === state.epoch && generation === runGeneration(run.id) && state.backgroundStreams.get(run.id) === stream && !controller.signal.aborted) {
+            if ([404, 405, 501].includes(error.status)) {
+              state.backgroundStreams.delete(run.id); state.streamSupported = false;
+              if (state.detailLoading || state.detailError || !state.run) { state.streamStatus = "fallback"; startActivityWatch(state.history, state.detailLoading ? 1000 : 0); }
+              renderTransport(); return;
+            }
             stream.status = "reconnecting";
             stream.timer = setTimeout(watch, 4000);
             renderTransport();
@@ -750,20 +797,18 @@
   async function pollRun(epoch) {
     if (epoch !== state.epoch || !state.run || state.streamSupported !== false || state.connectionBlocked) return;
     const runId = state.run.id;
-    const generation = runGeneration(runId); const generations = new Map(state.runGenerations);
+    const generation = runGeneration(runId);
+    const history = state.history; const activityVersion = history?.activityVersion;
     try {
-      const refreshProject = state.runs.some((item) => item.id !== runId && activeStatuses.has(item.status));
-      const [response, projectRuns] = await Promise.all([
-        api(`/runs/${encodeURIComponent(runId)}`),
-        refreshProject ? api(`/runs?project_id=${encodeURIComponent(state.project.id)}`) : Promise.resolve(null),
+      const refreshProject = history && (activityBlocked() || projectActive()) || observedProjectRuns().some((item) => item.id !== runId && activeStatuses.has(item.status));
+      const readSelected = isActive() || !!state.detailError || (state.run.status === "completed" && !state.run.report);
+      const [response] = await Promise.all([
+        readSelected ? api(`/runs/${encodeURIComponent(runId)}`) : Promise.resolve(state.run),
+        refreshProject && history ? refreshRunActivity(history) : Promise.resolve(null),
       ]);
       if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId || state.streamSupported !== false) return;
       const previousStatus = state.run.status;
-      if (projectRuns) {
-        collection(projectRuns, "runs").forEach((item) => { if (runGeneration(item.id) === (generations.get(item.id) || 0)) updateRunList(item); });
-        state.runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      }
-      const run = updateRunList(response);
+      const run = updateRunList(response, !history || activityVersion === history.activityVersion);
       const selectedChanged = state.run.updated_at !== run.updated_at || previousStatus !== run.status;
       state.run = run;
       renderRun(!selectedChanged);
@@ -786,34 +831,166 @@
     }
   }
 
+  function isRunHistoryCurrent(history) { return state.history === history && state.project?.id === history.projectId && history.connectionEpoch === state.connectionEpoch && !state.connectionBlocked; }
+
+  function stopRunHistory() {
+    const history = state.history;
+    stopActivityWatch(history);
+    if (history) { history.epoch++; history.controller?.abort(); history.controller = null; history.loading = false; history.watchController?.abort(); history.watchController = null; }
+    state.detailController?.abort(); state.detailController = null; state.detailLoading = false;
+  }
+
+  function runSelectionStorage(projectId, value) {
+    const key = `signaldesk.runId.${projectId}`;
+    try {
+      if (value === undefined) return sessionStorage.getItem(key);
+      if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key);
+    } catch { /* Selection can still be retained in this page. */ }
+    return null;
+  }
+
+  function validateRunPage(response) {
+    if (!response || !Array.isArray(response.items) || !Object.hasOwn(response, "active_run") || typeof response.has_more !== "boolean" || !(response.next_cursor === null || typeof response.next_cursor === "string")) throw new Error("服务未返回完整的研究历史分页信息，请更新服务后重试。");
+    return response;
+  }
+
+  function applyRunActivity(history, active, version, sequence) {
+    if (!isRunHistoryCurrent(history) || history.activityVersion !== version || history.activitySequence !== sequence) return;
+    if (active && active.project_id !== history.projectId) throw new Error("项目活动任务的归属不匹配。");
+    const current = active ? updateRunList(active, false) : null;
+    history.activeId = current && activeStatuses.has(current.status) ? current.id : null;
+    history.activityKnown = true; history.activityError = ""; history.activityVersion++;
+    if (current && state.run?.id === current.id) state.run = { ...state.run, ...current };
+  }
+
+  async function refreshRunActivity(history) {
+    if (!isRunHistoryCurrent(history)) return;
+    history.watchController?.abort(); const controller = new AbortController(); history.watchController = controller;
+    const version = history.activityVersion; const sequence = ++history.activitySequence;
+    try {
+      const response = validateRunPage(await api(`/projects/${encodeURIComponent(history.projectId)}/runs/page?limit=1`, { signal: controller.signal }));
+      if (!isRunHistoryCurrent(history) || controller.signal.aborted) return;
+      applyRunActivity(history, response.active_run, version, sequence);
+      renderMode(); renderHistory();
+    } catch (error) {
+      if (controller.signal.aborted || !isRunHistoryCurrent(history)) return;
+      if (history.activityVersion === version && history.activitySequence === sequence) history.activityError = `项目活动状态更新失败：${error.message} 暂时禁用编辑和启动研究。`;
+      renderMode(); renderHistory(); throw error;
+    } finally { if (history.watchController === controller) history.watchController = null; }
+  }
+
+  function stopActivityWatch(history) {
+    if (!history) return;
+    history.activityWatchEpoch = (history.activityWatchEpoch || 0) + 1;
+    clearTimeout(history.activityTimer); history.activityTimer = null;
+    clearTimeout(history.detailObservationTimer); history.detailObservationTimer = null;
+    history.watchController?.abort(); history.watchController = null;
+  }
+
+  function startActivityWatch(history, delay = 0) {
+    if (!history || !isRunHistoryCurrent(history) || (!projectActive() && !activityBlocked())) return;
+    stopActivityWatch(history); const ticket = history.activityWatchEpoch;
+    async function watch() {
+      if (!isRunHistoryCurrent(history) || history.activityWatchEpoch !== ticket) return;
+      history.activityTimer = null;
+      try { await refreshRunActivity(history); } catch { /* The activity status exposes the error and keeps writes locked. */ }
+      if (isRunHistoryCurrent(history) && history.activityWatchEpoch === ticket && (projectActive() || activityBlocked())) history.activityTimer = setTimeout(watch, history.activityError ? 4000 : 1000);
+    }
+    if (delay) history.activityTimer = setTimeout(watch, delay); else watch();
+  }
+
+  function observeWhileDetailsLoad(epoch) {
+    if (epoch !== state.epoch || state.connectionBlocked) return;
+    const history = state.history;
+    if (history) { clearTimeout(history.detailObservationTimer); history.detailObservationTimer = null; }
+    if (state.streamSupported === false) { state.streamStatus = "fallback"; renderTransport(); startActivityWatch(state.history, state.detailLoading ? 1000 : 0); }
+    else if (state.streamSupported === null && state.detailLoading) {
+      if (history) history.detailObservationTimer = setTimeout(() => { history.detailObservationTimer = null; if (epoch === state.epoch && state.detailLoading) syncBackgroundStreams(epoch); }, 1000);
+    }
+    else syncBackgroundStreams(epoch);
+  }
+
+  async function loadRunHistory(history, more = false) {
+    if (!isRunHistoryCurrent(history) || (more && (!history.hasMore || history.loading))) return;
+    history.controller?.abort(); const controller = new AbortController(); history.controller = controller;
+    const epoch = ++history.epoch; const selection = history.selectionEpoch;
+    const version = history.activityVersion; const sequence = ++history.activitySequence;
+    const cursor = more ? history.nextCursor : null;
+    history.loading = true; history.mode = more ? "more" : "refresh"; history.error = ""; renderHistory();
+    try {
+      const response = validateRunPage(await api(`/projects/${encodeURIComponent(history.projectId)}/runs/page?limit=20${cursor ? "&cursor=" + encodeURIComponent(cursor) : ""}`, { signal: controller.signal }));
+      if (!isRunHistoryCurrent(history) || controller.signal.aborted || epoch !== history.epoch) return;
+      if (response.items.some((run) => run.project_id !== history.projectId) || response.active_run && response.active_run.project_id !== history.projectId) throw new Error("历史摘要或活动任务的项目归属不匹配。");
+      response.items.forEach((run) => updateRunList(run, false));
+      history.ids = [...new Set([...(more ? history.ids : []), ...response.items.map((run) => run.id)])];
+      history.nextCursor = response.next_cursor; history.hasMore = response.has_more; history.loaded = true;
+      applyRunActivity(history, response.active_run, version, sequence);
+      state.runsLoading = false; history.loading = false; renderRun(true);
+      syncTransport(state.epoch);
+      if (!more && selection === history.selectionEpoch && !state.run && !state.detailLoading) {
+        const chosen = state.selectedRunId || history.ids[0] || history.activeId;
+        if (chosen) await selectRun(chosen);
+      }
+    } catch (error) {
+      if (!isRunHistoryCurrent(history) || controller.signal.aborted || epoch !== history.epoch) return;
+      history.error = `历史读取失败：${error.message} 已加载记录和当前选择仍保留，可点击${more ? "加载更多" : "刷新"}重试。`;
+      if (!more && history.activityVersion === version && history.activitySequence === sequence) history.activityError = "项目活动状态尚未确认，请刷新历史后再编辑或启动研究。";
+      if (!history.loaded && state.selectedRunId && selection === history.selectionEpoch && !state.run && !state.detailLoading) await selectRun(state.selectedRunId);
+    } finally {
+      if (history.controller === controller) history.controller = null;
+      if (isRunHistoryCurrent(history) && epoch === history.epoch) { history.loading = false; renderRun(true); }
+    }
+  }
+
   async function selectRun(runId) {
     stopTransport();
+    state.detailController?.abort(); const controller = new AbortController(); state.detailController = controller;
     const epoch = ++state.epoch;
     const generation = runGeneration(runId);
+    const history = state.history; const activityVersion = history?.activityVersion;
+    if (history) history.selectionEpoch++;
+    state.selectedRunId = runId; state.detailLoading = true; state.detailError = "";
+    runSelectionStorage(state.project.id, runId);
     state.events = []; state.eventAfter = 0; state.pollingError = ""; resetSearch();
     $("evidence-query").value = "";
     state.run = state.runs.find((run) => run.id === runId) || null;
     renderRun(); renderEvidence();
+    observeWhileDetailsLoad(epoch);
     try {
-      const run = await api(`/runs/${encodeURIComponent(runId)}`);
-      if (epoch !== state.epoch || generation !== runGeneration(runId)) return;
-      state.run = updateRunList(run);
+      const run = await api(`/runs/${encodeURIComponent(runId)}`, { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.epoch || generation !== runGeneration(runId)) return;
+      if (run?.id !== runId || run.project_id !== state.project?.id) { const error = new Error("所选研究不属于当前项目。"); error.status = 404; throw error; }
+      state.run = updateRunList(run, !history || activityVersion === history.activityVersion);
+      state.detailLoading = false;
+      stopActivityWatch(history);
       renderRun(); if (!$("evidence-query").value.trim()) renderEvidence();
       syncTransport(epoch);
     } catch (error) {
-      if (epoch === state.epoch && generation === runGeneration(runId)) {
+      if (!controller.signal.aborted && error.name !== "AbortError" && epoch === state.epoch && generation === runGeneration(runId)) {
+        state.detailLoading = false; state.detailError = error.message;
+        if (error.status === 404) {
+          runSelectionStorage(state.project.id, null); state.selectedRunId = null; state.run = null;
+          state.runs = state.runs.filter((run) => run.id !== runId);
+          if (history) { history.ids = history.ids.filter((id) => id !== runId); if (history.activeId === runId) { history.activeId = null; history.activityKnown = false; history.activityError = "此前活动任务已不可读取，请刷新历史确认项目状态。"; } }
+          const fallback = historyRuns().find((run) => run.id !== runId);
+          if (fallback) { toast("此前选择的研究已不可用，已恢复另一条历史记录。"); await selectRun(fallback.id); return; }
+        }
         state.pollingError = `读取研究详情失败：${error.message} 可点击重试恢复连接。`;
-        renderPollingError();
-        state.streamTimer = setTimeout(() => syncTransport(epoch), 4000);
+        renderRun();
+        observeWhileDetailsLoad(epoch);
       }
-    }
+    } finally { if (state.detailController === controller) { state.detailController = null; state.detailLoading = false; } }
   }
 
   async function selectProject(project) {
     stopTransport();
+    stopRunHistory();
     stopExtensionObservers();
-    const epoch = ++state.epoch;
+    state.epoch++;
     state.project = project; state.runs = []; state.run = null; state.events = []; state.eventAfter = 0; state.pollingError = ""; state.runsLoading = true; resetSearch();
+    state.selectedRunId = runSelectionStorage(project.id) || null; state.detailLoading = false; state.detailError = "";
+    const history = { projectId: project.id, connectionEpoch: state.connectionEpoch, ids: [], nextCursor: null, hasMore: false, loading: false, loaded: false, error: "", mode: "refresh", controller: null, epoch: 0, selectionEpoch: 0, activeId: null, activityKnown: false, activityError: "", activityVersion: 0, activitySequence: 0, watchController: null };
+    state.history = history;
     showError("");
     $("welcome").hidden = true; $("project-workspace").hidden = false;
     $("project-title").textContent = project.name;
@@ -827,21 +1004,12 @@
     loadMemory(project.id);
     loadExtensionProject(project.id);
     try { sessionStorage.setItem("signaldesk.projectId", project.id); } catch { /* session storage is optional */ }
-    try {
-      const result = await api(`/runs?project_id=${encodeURIComponent(project.id)}`);
-      if (epoch !== state.epoch) return;
-      state.runs = collection(result, "runs").sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      state.runsLoading = false;
-      renderRun();
-      if (state.runs.length) {
-        if (state.runs.some((run) => run.mode === "demo" && run.demo_revision === 1 && run.status === "completed")) $("demo-revision").value = "2";
-        await selectRun(state.runs[0].id);
-      }
-    } catch (error) { if (epoch === state.epoch) { state.runsLoading = true; renderMode(); showError(`${error.message} 任务状态未知，暂时禁用编辑与启动研究；请重新连接。`); } }
+    await loadRunHistory(history);
+    if (isRunHistoryCurrent(history) && state.runs.some((run) => run.mode === "demo" && run.demo_revision === 1 && run.status === "completed")) $("demo-revision").value = "2";
   }
 
   async function connect() {
-    stopTransport(); stopExtensionObservers(); state.streamSupported = null;
+    stopTransport(); stopRunHistory(); stopExtensionObservers(); state.streamSupported = null;
     state.epoch++;
     const connectionEpoch = ++state.connectionEpoch;
     state.connectionController?.abort();
@@ -875,7 +1043,7 @@
         let previousId;
         try { previousId = sessionStorage.getItem("signaldesk.projectId"); } catch { /* optional */ }
         await selectProject(state.projects.find((project) => project.id === previousId) || state.projects[0]);
-      } else { state.project = null; $("welcome").hidden = false; $("project-workspace").hidden = true; $("breadcrumb-project").textContent = "项目总览"; }
+      } else { state.project = null; state.history = null; state.selectedRunId = null; state.detailLoading = false; state.detailError = ""; $("welcome").hidden = false; $("project-workspace").hidden = true; $("breadcrumb-project").textContent = "项目总览"; }
       if (connectionEpoch === state.connectionEpoch && healthResult.status === "rejected") showError(healthResult.reason.message);
     } catch (error) {
       if (connectionEpoch !== state.connectionEpoch || controller.signal.aborted || error.name === "AbortError") return;
@@ -887,7 +1055,7 @@
   function openProjectDialog(edit = false) {
     // Event handlers also call this function; only explicit true selects edit mode.
     edit = edit === true;
-    if (edit && (!state.project || projectActive() || state.runsLoading)) { toast("项目有等待或执行中的任务，结束后再编辑。历史报告与快照会保留。", true); return; }
+    if (edit && (!state.project || projectActive() || activityBlocked() || state.runsLoading)) { toast("项目有活动任务，或活动状态尚未确认，请刷新历史后再编辑。历史报告与快照会保留。", true); return; }
     state.editProjectId = edit ? state.project.id : null;
     state.projectFormEpoch++;
     state.extraFocus = edit ? (state.project.focus || []).filter((focus) => !["pricing", "features", "positioning"].includes(focus)) : [];
@@ -943,7 +1111,7 @@
       if (!name) throw new Error("请填写项目名称。");
       const focus = [...Array.from(document.querySelectorAll('#project-form input[name="focus"]:checked')).map((input) => input.value), ...state.extraFocus];
       if (!focus.length) throw new Error("请至少选择一个研究重点。");
-      if (state.editProjectId && projectActive()) throw new Error("项目任务正在等待或执行，当前不能编辑。请等待任务结束后保存。");
+      if (state.editProjectId && (projectActive() || activityBlocked())) throw new Error("项目有活动任务，或活动状态尚未确认，当前不能编辑。请等待任务结束或刷新历史后保存。");
       state.actionBusy = true; $("submit-project").disabled = true;
       const editingId = state.editProjectId;
       const project = await api(editingId ? `/projects/${encodeURIComponent(editingId)}` : "/projects", { method: editingId ? "PUT" : "POST", body: JSON.stringify({ name, description: $("project-desc").value.trim(), sources, focus }) });
@@ -972,12 +1140,13 @@
   }
 
   async function startRun() {
-    if (!state.project || state.actionBusy || projectActive() || state.connectionBlocked || state.disconnected) return;
+    if (!state.project || state.actionBusy || projectActive() || activityBlocked() || state.runsLoading || state.connectionBlocked || state.disconnected) return;
     const project = state.project; const epoch = state.epoch; const connectionEpoch = state.connectionEpoch;
     const mode = $("research-mode").value;
     if (mode === "demo" && !isDemoProject(project)) { showError("演示模式仅支持 Northstar / Orbit 内置虚构来源。请为真实网址选择「真实调研」，或从首页体验演示项目。"); return; }
     if (mode === "live" && isDemoProject(project)) { showError("本项目使用 .example 演示地址。请先新建项目并填写真实来源，再启动真实调研。"); return; }
     state.actionBusy = true; renderMode(); showError("");
+    if (state.history) state.history.activityVersion++;
     try {
       const run = await api(`/projects/${encodeURIComponent(project.id)}/runs`, { method: "POST", body: JSON.stringify({ mode, demo_revision: Number($("demo-revision").value) }) });
       if (connectionEpoch !== state.connectionEpoch || state.project?.id !== project.id) return;
@@ -1576,7 +1745,9 @@
   $("export-markdown").addEventListener("click", () => exportReport("markdown"));
   $("export-json").addEventListener("click", () => exportReport("json"));
   $("retry-connection").addEventListener("click", connect);
-  $("retry-poll").addEventListener("click", () => { state.pollingError = ""; renderPollingError(); syncTransport(state.epoch, true); });
+  $("retry-poll").addEventListener("click", () => { if (state.detailError && state.selectedRunId) return selectRun(state.selectedRunId); state.pollingError = ""; renderPollingError(); syncTransport(state.epoch, true); });
+  $("refresh-runs").addEventListener("click", () => { if (state.history) return loadRunHistory(state.history); });
+  $("load-more-runs").addEventListener("click", () => { if (state.history) return loadRunHistory(state.history, true); });
   $("retry-stream").addEventListener("click", () => syncTransport(state.epoch, true));
   $("refresh-memory").addEventListener("click", () => loadMemory());
   $("memory-form").addEventListener("submit", saveMemory);
@@ -1645,9 +1816,11 @@
   });
   document.querySelectorAll(".close-dialog").forEach((button) => button.addEventListener("click", () => { const dialog = button.closest("dialog"); if (dialog.id === "project-dialog") state.projectFormEpoch++; dialog.close(); }));
   window.addEventListener("pagehide", stopTransport);
+  window.addEventListener("pagehide", stopRunHistory);
   window.addEventListener("pagehide", stopExtensionObservers);
   window.addEventListener("pageshow", (event) => { if (event.persisted && state.run) syncTransport(state.epoch); });
   window.addEventListener("pageshow", (event) => { if (event.persisted && state.project) loadExtensionProject(state.project.id); });
+  window.addEventListener("pageshow", (event) => { if (event.persisted && state.history) refreshRunActivity(state.history).catch(() => {}); });
   window.addEventListener("offline", () => connectionState(true, "浏览器当前离线。已有研究结果仍保留，恢复网络后可重新连接。"));
   window.addEventListener("online", () => { if (state.run && !state.connectionBlocked) syncTransport(state.epoch, true); else connect(); });
   setInterval(() => { if (isActive()) updateElapsed(); }, 1000);

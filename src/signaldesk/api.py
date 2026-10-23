@@ -10,6 +10,7 @@ from signaldesk import __version__
 from signaldesk.auth import authenticate_bearer
 from signaldesk.config import Settings
 from signaldesk.exports import ExportUnavailable, attachment_filename, export_json, export_markdown
+from signaldesk.history import HistoryCursorError
 from signaldesk.jobs import JobManager
 from signaldesk.repository import (
     MAX_EVENT_CURSOR,
@@ -17,7 +18,14 @@ from signaldesk.repository import (
     Repository,
     RunConfigurationError,
 )
-from signaldesk.schemas import EventRead, ProjectCreate, ProjectRead, RunCreate, RunRead
+from signaldesk.schemas import (
+    EventRead,
+    ProjectCreate,
+    ProjectRead,
+    RunCreate,
+    RunHistoryPage,
+    RunRead,
+)
 
 
 def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> APIRouter:
@@ -175,6 +183,19 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
         if project_id is not None:
             await require_project(project_id)
         return await repo.list_runs(project_id)
+
+    @protected.get("/projects/{project_id}/runs/page", response_model=RunHistoryPage)
+    async def page_runs(
+        project_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=512),
+    ):
+        try:
+            return await repo.page_runs(project_id, limit=limit, cursor=cursor)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="项目不存在。") from exc
+        except HistoryCursorError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @protected.get("/runs/{run_id}", response_model=RunRead)
     async def get_run(run_id: str):

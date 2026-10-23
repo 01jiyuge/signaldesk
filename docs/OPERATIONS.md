@@ -1,6 +1,6 @@
 # 启动、配置与验证
 
-更新：2026-10-23。当前 V0.4.4 为本地单用户、单进程可运行版本；历史分页和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。本轮状态、索引与协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)，验收结果见该文档。
+更新：2026-10-23。当前 V0.4.5 为本地单用户、单进程可运行版本；扩展历史和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。本轮轻量历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，验收结果见该文档。
 
 ## 1. 本地启动
 
@@ -27,6 +27,9 @@ uv run signaldesk
 
 V0.2 可在项目标题旁编辑来源与关注规则，活动任务结束后才允许保存。旧报告继续使用原证据。
 已完成报告可点击 Markdown / JSON 导出；新旧快照和引用随报告一起保留。
+
+研究历史首屏加载 20 条轻量摘要，使用“加载更多”继续读取。完整报告在选择运行后按需获取；页外选中项和活动项单独保留，不改变已加载条数或下一页游标。新客户端应使用 `GET /api/projects/{id}/runs/page`，旧 `GET /api/runs` 仍全量返回含报告的记录，仅作兼容。
+本轮升级不增加数据列或依赖，但首次启动会为旧库补建运行历史索引；按既有流程备份业务库、checkpointer 和 Store 后更新并重启即可。
 
 以上产品、日期与价格全部为虚构测试夹具；不访问示例域名，不调用模型 API。
 演示与真实模式都写入 mode 字段。用户应为真实来源另建项目，避免示例与业务材料混用。
@@ -132,6 +135,7 @@ RERANKER_TIMEOUT_SECONDS=20
 界面“项目记忆”可新增、编辑、移除明确偏好；系统独立保存最近运行摘要。
 collect 开始时冻结记忆，运行期间修改的偏好用于下一次运行，恢复沿用原上下文。
 默认每类保留 50 项（`MEMORY_MAX_ITEMS`），单个偏好值不超过 8KB；摘要不是事实认证。
+偏好与运行摘要按精确项目命名空间及类别分别计数；后代命名空间或被其他类别占用的 Store key 不会被覆盖或清理。有界扫描无法证明已完整读取时拒绝操作，项目记忆列表也返回 409；先检查 Store 中的外来记录或历史溢出，再重试，不把不完整扫描当作空记忆。
 升级备份需同时保留业务库、checkpointer 与 Store；SQLite 三个文件应在服务停止后一起备份。
 
 ## 5. MCP
@@ -193,7 +197,7 @@ uv run signaldesk-eval --output data/evaluation.json
 来源限制、引用拒绝、Deep Agents 实图与脚本模型、Skills 读取、只读 MCP 以及项目历史隔离。
 脚本模型只用于验证真实框架的调用接口，不代表真实模型效果。
 
-以下保留 V0.4.3 验证历史：完整 Python 回归344项通过，前端行为测试12项通过。实际PostgreSQL测试7项、实际Docker测试3项，其中一项PG测试结合Docker；按环境变量明确启用，缺少条件会跳过。V0.4.4 完整回归427项通过，前端19项通过；真实PostgreSQL测试9项、Docker测试3项，详情见 [升级说明](./V0.4.4_UPGRADE.md)。
+以下保留验证历史：V0.4.3 完整 Python 回归344项通过、前端行为测试12项通过；真实PostgreSQL测试7项、Docker测试3项，其中一项PG测试结合Docker。V0.4.4 完整回归427项通过、前端19项通过；真实PostgreSQL测试9项、Docker测试3项，详情见 [历史升级说明](./V0.4.4_UPGRADE.md)。V0.4.5 完整回归457项通过、前端32项通过；真实PostgreSQL测试11项、Docker测试3项，见 [本轮说明](./V0.4.5_UPGRADE.md)。真实集成测试按环境变量明确启用，缺少条件会跳过。
 实际数据库测试覆盖 GIN 全文、向量、Store、checkpointer 和应用整体；嵌入输入是确定性夹具，不调用供应商。
 Chrome 已验证 SSE 续传、项目切换、记忆 CRUD 和服务重启持久化。
 

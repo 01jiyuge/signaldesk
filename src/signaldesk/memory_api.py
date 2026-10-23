@@ -60,7 +60,10 @@ def create_memory_router(
         project_id: str, request: Request, limit: int = Query(default=10, ge=1, le=1000)
     ):
         await require_project(project_id)
-        return await resolve_memory(request).load_context(project_id, limit=limit)
+        try:
+            return await resolve_memory(request).load_context(project_id, limit=limit)
+        except MemoryLimitError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @router.get("/{project_id}/memory/{key}")
     async def get_memory(project_id: str, key: str, request: Request):

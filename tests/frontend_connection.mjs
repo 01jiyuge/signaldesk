@@ -150,7 +150,7 @@ test("successful access verification restores writes and subscribes to the selec
     if (url === "/api/capabilities") return json({ extensions: {} });
     if (url.includes("/executions/page") || url.includes("/delegations/page")) return json({ items: [], next_cursor: null, has_more: false });
     if (url.endsWith("/memory")) return json({ preferences: [], recent_runs: [] });
-    if (url === "/api/runs?project_id=p") return json([run("running")]);
+    if (url === "/api/projects/p/runs/page?limit=20") return json({ items: [run("running")], next_cursor: null, has_more: false, active_run: run("running") });
     if (url === "/api/runs/r") return json(run("running"));
     if (url.startsWith("/api/runs/r/ag-ui?")) {
       const events = [{ type: "RUN_STARTED", runId: "r", threadId: "p" }, { type: "STATE_SNAPSHOT", snapshot: { run: completed } }, { type: "RUN_FINISHED", runId: "r", threadId: "p" }];
@@ -225,7 +225,7 @@ test("memory save/delete do not toast into a later connection or project after t
       if (url === "/api/projects") return json([]);
       if (url === "/api/capabilities") return json({ extensions: {} });
       if (url === "/api/projects/q/memory") return json({ preferences: [], recent_runs: [] });
-      if (url === "/api/runs?project_id=q") return json([]);
+      if (url === "/api/projects/q/runs/page?limit=20") return json({ items: [], next_cursor: null, has_more: false, active_run: null });
       if (url.includes("/executions/page") || url.includes("/delegations/page")) return json({ items: [], next_cursor: null, has_more: false });
       throw new Error(`Unexpected HTTP request: ${url}`);
     });

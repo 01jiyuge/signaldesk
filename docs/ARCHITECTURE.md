@@ -1,6 +1,6 @@
 # SignalDesk 技术架构与接口
 
-范围：当前 V0.4.4，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，历史分页与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。本轮状态、索引与协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
+范围：当前 V0.4.5，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，扩展历史与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。本轮轻量运行历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
 
 ## 1. 技术选择与边界
 
@@ -205,12 +205,13 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 | 项目详情 | `GET /api/projects/{project_id}` | 项目不存在时返回 404 |
 | 编辑项目 | `PUT /api/projects/{project_id}` | 全量 ProjectCreate；保留历史，活动任务期间返回 409 |
 | 发起运行 | `POST /api/projects/{project_id}/runs` | `{mode: demo\|live, demo_revision: 1\|2}`；默认 demo/1，成功 202 |
-| 运行列表 | `GET /api/runs?project_id=...` | project_id 可选；返回按创建时间倒序的 RunRead 数组 |
+| 运行历史分页 | `GET /api/projects/{project_id}/runs/page?limit=20&cursor=...` | items 为不含 report 的 RunSummaryRead；返回 next_cursor、has_more 和独立 active_run；limit 1–100 |
+| 旧运行列表 | `GET /api/runs?project_id=...` | 保留兼容，project_id 可选；全量 RunRead 数组含 report，新控制台使用分页接口 |
 | 运行状态与报告 | `GET /api/runs/{run_id}` | 返回 RunRead；报告保存在 report 字段，没有独立 /report 路由 |
 | 导出报告 | `GET /api/runs/{run_id}/export?format=markdown\|json` | 完整的已完成报告作为附件下载；认证与其他业务 API 相同 |
 | 增量事件 | `GET /api/runs/{run_id}/events?after=N` | 只返回此运行 id>N 的事件数组；after 范围为 0–2147483647 |
 | AG-UI 事件流 | `GET /api/runs/{run_id}/ag-ui?after=N` | `text/event-stream`；Last-Event-ID 与 after 使用相同数据库游标范围，越界 422 |
-| 项目记忆 | `GET /api/projects/{project_id}/memory?limit=10` | 明确偏好与最近运行摘要 |
+| 项目记忆 | `GET /api/projects/{project_id}/memory?limit=10` | 明确偏好与最近运行摘要；有界扫描不能证明完整时返回 409 |
 | 单项偏好 | `GET/PUT/DELETE /api/projects/{project_id}/memory/{key}` | PUT 接收 `{ "value": { ... } }`，DELETE 成功 204 |
 | 手动恢复 | `POST /api/runs/{run_id}/resume` | interrupted/failed/cancelled 可申请恢复，成功 202；执行器继续检查图状态 |
 | 取消运行 | `POST /api/runs/{run_id}/cancel` | 仅 queued/running 可取消；返回更新的 RunRead |
@@ -218,6 +219,10 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 | 只读 MCP | 独立 `signaldesk-mcp` 命令 | 默认 stdio 服务，不是上述 HTTP API 下的一组写路由 |
 
 错误语义：401 表示 token 缺失或不正确；404 表示资源不存在；422 表示输入或 live 配置不合法；409 表示项目有活动任务、恢复/取消状态冲突、报告不可导出或执行器正在关闭。请求恢复成功只表示加入队列，不能据 202 声称最终已经恢复完成。
+
+`RunSummaryRead` 仅包含 `id/project_id/mode/demo_revision/status/stage/error/created_at/updated_at`，没有 `report` 字段，SQL 也不选择报告列。页序使用不可变的 `created_at DESC, id DESC`；游标绑定项目与 `runs` 类型。`active_run` 独立查询整个项目，不受分页位置影响，供活动观察和编辑/提交限制使用。详情继续通过已有 `GET /api/runs/{id}` 按需读取。
+
+`runs` 增加 `(project_id, created_at DESC, id DESC)` 索引，初始化显式为已有表补建缺失索引，不修改原记录。启动恢复使用 `list_active_runs()` 的轻量摘要，不再通过旧 `list_runs()` 载入全部历史报告。
 
 ### AG-UI 事件契约
 
@@ -272,9 +277,10 @@ signaldesk/
 │   ├── config.py               # 类型化设置与 live 配置检查
 │   ├── schemas.py              # HTTP、报告与证据 schema
 │   ├── db.py                   # 四张 SQLAlchemy 业务表
-│   ├── repository.py           # 异步持久化、基线与词法查询
+│   ├── repository.py           # 持久化、轻量运行分页、基线与词法查询
 │   ├── api.py                  # HTTP 路由、token 与输入校验
 │   ├── auth.py                 # 业务与协议共用的 Bearer 校验
+│   ├── history.py              # 项目/类型绑定的 keyset 游标与分页封装
 │   ├── exports.py              # Markdown/JSON 附件与完整性检查
 │   ├── errors.py               # 安全错误码与处理建议
 │   ├── jobs.py                 # 单进程有界任务池与取消/恢复状态
@@ -284,7 +290,7 @@ signaldesk/
 │   ├── research.py             # Deep Agents、Skills 与引用一致性
 │   ├── retrieval.py            # 全文/词法/pgvector 召回与 RRF
 │   ├── reranking.py            # none / lexical / HTTP 模型重排
-│   ├── memory.py               # SQLite/PG Store 与项目记忆
+│   ├── memory.py               # SQLite/PG Store、精确类别扫描与项目记忆
 │   ├── memory_api.py           # 明确偏好 CRUD
 │   ├── agui.py                 # 标准事件 SSE 投影与续传
 │   ├── evaluation.py           # 固定夹具与 LangSmith 实验
@@ -305,7 +311,9 @@ signaldesk/
 │   ├── ROADMAP.md
 │   ├── V0.2_UPGRADE.md          # 历史变更
 │   ├── V0.3_UPGRADE.md          # 历史变更
-│   ├── V0.4_UPGRADE.md          # 本轮Sandbox/A2A实现与验收
+│   ├── V0.4_UPGRADE.md          # Sandbox/A2A历史实现与验收
+│   ├── V0.4.4_UPGRADE.md        # 状态、索引与协议收尾
+│   ├── V0.4.5_UPGRADE.md        # 轻量运行历史与记忆范围
 │   ├── SANDBOX.md              # Docker隔离配置与执行API
 │   ├── A2A.md                  # 协议、Card、双实例接入
 │   └── OPERATIONS.md            # 启动、配置与验证边界

@@ -50,6 +50,10 @@ Index(
     postgresql_where=text("status IN ('queued', 'running')"),
 )
 
+RUN_HISTORY_INDEX = Index(
+    "ix_runs_project_created_id", Run.project_id, Run.created_at.desc(), Run.id.desc()
+)
+
 
 class Snapshot(Base):
     __tablename__ = "snapshots"

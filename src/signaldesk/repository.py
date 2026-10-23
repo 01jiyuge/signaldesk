@@ -13,18 +13,31 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from signaldesk.config import Settings
-from signaldesk.db import Base, Event, Project, Run, Snapshot, utcnow
+from signaldesk.db import RUN_HISTORY_INDEX, Base, Event, Project, Run, Snapshot, utcnow
+from signaldesk.history import before_position, decode_cursor, history_page
 from signaldesk.schemas import (
     EventRead,
     ProjectCreate,
     ProjectRead,
     RunCreate,
     RunRead,
+    RunSummaryRead,
     SnapshotRecord,
 )
 
 # Event.id uses Integer: PostgreSQL's signed int32 is the portable cursor range.
 MAX_EVENT_CURSOR = 2**31 - 1
+RUN_SUMMARY_COLUMNS = (
+    Run.id,
+    Run.project_id,
+    Run.mode,
+    Run.demo_revision,
+    Run.status,
+    Run.stage,
+    Run.error,
+    Run.created_at,
+    Run.updated_at,
+)
 
 
 class ActiveRunError(ValueError):
@@ -89,6 +102,13 @@ def _snapshot(row: Snapshot) -> SnapshotRecord:
     )
 
 
+def _run_summary(row) -> RunSummaryRead:
+    values = dict(row)
+    values["created_at"] = _iso(values["created_at"])
+    values["updated_at"] = _iso(values["updated_at"])
+    return RunSummaryRead.model_validate(values)
+
+
 class Repository:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -115,6 +135,9 @@ class Repository:
                 await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            # create_all skips indexes on tables that already exist. Upgrade an
+            # older database without recreating its runs table or user data.
+            await connection.run_sync(lambda sync: RUN_HISTORY_INDEX.create(sync, checkfirst=True))
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -291,6 +314,47 @@ class Repository:
             query = query.where(Run.project_id == project_id)
         async with self.sessions() as session:
             return [_run(row) for row in (await session.scalars(query)).all()]
+
+    async def list_active_runs(self, project_id: str | None = None) -> list[RunSummaryRead]:
+        query = (
+            select(*RUN_SUMMARY_COLUMNS)
+            .where(Run.status.in_(("queued", "running")))
+            .order_by(Run.created_at.desc(), Run.id.desc())
+        )
+        if project_id is not None:
+            query = query.where(Run.project_id == project_id)
+        async with self.sessions() as session:
+            rows = (await session.execute(query)).mappings().all()
+        return [_run_summary(row) for row in rows]
+
+    async def page_runs(
+        self, project_id: str, *, limit: int = 20, cursor: str | None = None
+    ) -> dict:
+        if await self.get_project(project_id) is None:
+            raise KeyError(project_id)
+        if not 1 <= limit <= 100:
+            raise ValueError("History page size must be between 1 and 100")
+        position = decode_cursor(cursor, project_id=project_id, resource="runs")
+        query = select(*RUN_SUMMARY_COLUMNS).where(Run.project_id == project_id)
+        if position is not None:
+            query = query.where(before_position(Run.created_at, Run.id, position))
+        query = query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit + 1)
+        active_query = (
+            select(*RUN_SUMMARY_COLUMNS)
+            .where(Run.project_id == project_id, Run.status.in_(("queued", "running")))
+            .limit(1)
+        )
+        async with self.sessions() as session:
+            rows = (await session.execute(query)).mappings().all()
+            active = (await session.execute(active_query)).mappings().first()
+        page = history_page(
+            [_run_summary(row).model_dump(mode="json") for row in rows],
+            limit=limit,
+            project_id=project_id,
+            resource="runs",
+        )
+        page["active_run"] = _run_summary(active).model_dump(mode="json") if active else None
+        return page
 
     async def update_run(self, run_id: str, **fields) -> RunRead | None:
         # Joining the transaction on cancellation matters for aiosqlite: its

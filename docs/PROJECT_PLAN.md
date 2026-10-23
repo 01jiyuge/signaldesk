@@ -1,6 +1,6 @@
 # SignalDesk · 竞品情报 Agent 项目方案
 
-更新日期：2026-10-23。当前实现为 V0.4.4，本地单用户、单进程验证版本。本文保留产品目标和首期设计，历史能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)、[V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)、[V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md) 和 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)。本轮鉴权、状态保护、向量回填与报告安全见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。
+更新日期：2026-10-23。当前实现为 V0.4.5，本地单用户、单进程验证版本。本文保留产品目标和首期设计，历史能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)、[V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)、[V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)、[V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md) 和 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。本轮轻量运行历史、按需详情与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)。
 
 > 本文中的“V0.1 目标”是验收要求，不代表所有目标已经验证。实现与验证状态见 [ROADMAP.md](./ROADMAP.md) 的状态表；接口和目录以 [ARCHITECTURE.md](./ARCHITECTURE.md) 及运行中的 OpenAPI 为准。演示数据必须标为夹具，不能作为真实市场情报。当前 verify 节点检查引用是否指向存在的证据、引文是否存在于原文；这不等于证明事实真实或推理成立。
 
@@ -108,7 +108,7 @@ V0.3 使用独立 LangGraph Store：按项目保存用户明确偏好和经过�
 
 逻辑实体包括监控项目、竞品、来源、运行、来源快照、变化/事实、证据、报告与检查点关联。核心业务表为 `projects`、`runs`、`snapshots`、`events`；来源放在项目 JSON 中，报告和证据放在运行的 `report` JSON 中。Sandbox、A2A、检索和 Store 的持久化结构及具体接口见 [ARCHITECTURE.md](./ARCHITECTURE.md)。时间以带时区的 ISO 8601 格式返回，显示时可转为本地时间，原始采集时间保留 UTC。
 
-接口覆盖健康与能力检查、项目配置、手动运行、状态与恢复、报告导出、AG-UI 事件订阅、项目记忆 CRUD、情报历史与只读检索。核心研究 API 不接受代码或宿主命令作为任务输入。显式启用的 Sandbox 扩展端点在通过 API 鉴权与项目校验后，接受 Python 和 JSON 并在受限 Docker 容器内执行；它不提供宿主 SQL、shell 或任意文件访问接口。静态控制台与后端使用同源接口，服务默认只绑定回环地址。
+接口覆盖健康与能力检查、项目配置、手动运行、状态与恢复、报告导出、AG-UI 事件订阅、项目记忆 CRUD、情报历史与只读检索。研究历史使用不含报告的项目范围游标页，选中后按需获取详情；页外活动任务独立查询，不能仅凭首屏判断项目空闲。核心研究 API 不接受代码或宿主命令作为任务输入。显式启用的 Sandbox 扩展端点在通过 API 鉴权与项目校验后，接受 Python 和 JSON 并在受限 Docker 容器内执行；它不提供宿主 SQL、shell 或任意文件访问接口。静态控制台与后端使用同源接口，服务默认只绑定回环地址。
 
 ## 6. 评测与验收
 

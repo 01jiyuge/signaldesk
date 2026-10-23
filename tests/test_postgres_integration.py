@@ -3,7 +3,7 @@
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from signaldesk.collector import content_hash
 from signaldesk.config import Settings
-from signaldesk.db import Snapshot
+from signaldesk.db import Run, Snapshot
 from signaldesk.repository import Repository
 from signaldesk.retrieval import Retriever
 from signaldesk.schemas import ProjectCreate, RunCreate, SnapshotRecord
@@ -569,3 +569,166 @@ async def test_postgres_memory_bulk_equal_times_repairs_retention_without_touchi
         await memory.remember_run(own.id, "latest", {"value": 200})
         assert [item.key for item in await store.asearch(namespace, limit=200)] == ["latest"]
         assert (await memory.get_preference(own.id, "language"))["value"] == {"value": "中文"}
+
+
+async def test_postgres_run_history_pages_are_light_and_keep_old_active_visible(postgres_schema):
+    from fastapi import FastAPI
+
+    from signaldesk.api import create_router
+    from signaldesk.jobs import JobManager
+
+    repo, settings, schema, _ = postgres_schema
+    own = await project(repo, "Paged history")
+    other = await project(repo, "Other history")
+    at = datetime(2026, 10, 23, tzinfo=UTC)
+    identifiers = [str(UUID(int=i + 1)) for i in range(30)]
+    old_active = str(UUID(int=100))
+    body = {"summary": "REPORT_BODY_MUST_NOT_APPEAR_" + "x" * 100_000}
+    rows = [
+        dict(
+            id=identifier,
+            project_id=own.id,
+            mode="demo",
+            demo_revision=1,
+            status="completed",
+            stage="completed",
+            error=None,
+            report=body,
+            created_at=at,
+            updated_at=at,
+        )
+        for identifier in identifiers
+    ]
+    rows.extend(
+        [
+            dict(
+                rows[0],
+                id=old_active,
+                report=None,
+                status="running",
+                stage="collect",
+                created_at=at - timedelta(days=1),
+            ),
+            dict(rows[0], id=str(uuid4()), project_id=other.id),
+        ]
+    )
+    async with repo.engine.begin() as connection:
+        await connection.execute(insert(Run), rows)
+        definition = await connection.scalar(
+            text(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname=:schema AND indexname='ix_runs_project_created_id'"
+            ),
+            {"schema": schema},
+        )
+    assert "created_at DESC" in definition and "id DESC" in definition
+
+    async def forbidden_runner(*args, **kwargs):
+        raise AssertionError("Read-only paging cannot start a research run")
+
+    jobs = JobManager(repo, forbidden_runner)
+    app = FastAPI()
+    app.include_router(create_router(repo, jobs, settings.model_copy(update={"api_token": ""})))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://fixture"
+    ) as client:
+        path = f"/api/projects/{own.id}/runs/page"
+        first = await client.get(path)
+        assert first.status_code == 200 and len(first.content) < 12_000
+        page = first.json()
+        assert [item["id"] for item in page["items"]] == sorted(identifiers, reverse=True)[:20]
+        assert page["active_run"]["id"] == old_active and "report" not in page["active_run"]
+        assert all("report" not in item for item in page["items"])
+        assert "REPORT_BODY_MUST_NOT_APPEAR" not in first.text
+        cursor = page["next_cursor"]
+        new_id = str(uuid4())
+        async with repo.engine.begin() as connection:
+            await connection.execute(
+                insert(Run), [dict(rows[0], id=new_id, created_at=at + timedelta(days=1))]
+            )
+        tail = (await client.get(path, params={"cursor": cursor})).json()
+        assert [item["id"] for item in tail["items"]] == sorted(identifiers, reverse=True)[20:] + [
+            old_active
+        ]
+        assert tail["active_run"]["id"] == old_active and not tail["has_more"]
+        assert tail["next_cursor"] is None
+        assert (
+            await client.get(f"/api/projects/{other.id}/runs/page", params={"cursor": cursor})
+        ).status_code == 422
+        detail = await client.get(f"/api/runs/{identifiers[0]}")
+        assert detail.json()["report"] == body
+        assert (await client.post(f"/api/projects/{own.id}/runs", json={})).status_code == 409
+    await jobs.shutdown()
+
+
+async def test_postgres_memory_exact_reads_skip_descendants_and_return_bounded_scan_409(
+    postgres_schema, monkeypatch
+):
+    from fastapi import FastAPI
+    from langgraph.store.base import PutOp
+
+    from signaldesk.memory import MemoryLimitError, ProjectMemory, open_memory_store
+    from signaldesk.memory_api import create_memory_router
+
+    repo, settings, schema, _ = postgres_schema
+    own = await project(repo, "Exact Store reads")
+    url = (
+        make_url(settings.database_url)
+        .set(drivername="postgresql")
+        .update_query_dict({"options": f"-csearch_path={schema},public"})
+        .render_as_string(hide_password=False)
+    )
+    settings = settings.model_copy(update={"memory_url": url, "api_token": ""})
+    preferences = ("projects", own.id, "preferences")
+    runs = ("projects", own.id, "runs")
+    async with open_memory_store(settings) as store:
+        memory = ProjectMemory(store, max_items=2)
+        await memory.set_preference(own.id, "language", {"value": "中文"})
+        await memory.remember_run(own.id, "own-run", {"value": "current context"})
+        await store.abatch(
+            [
+                PutOp(
+                    namespace + ("foreign",),
+                    f"child-{index}",
+                    {"kind": kind, "source": source, "content": {"value": index}},
+                )
+                for namespace, kind, source in [
+                    (preferences, "preference", "user"),
+                    (runs, "run_summary", "verified_run"),
+                ]
+                for index in range(80)
+            ]
+            + [
+                PutOp(
+                    preferences,
+                    "foreign-kind",
+                    {"kind": "other", "source": "system", "content": {"value": "keep"}},
+                )
+            ]
+        )
+        app = FastAPI()
+        app.include_router(create_memory_router(repo, memory, settings))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://fixture"
+        ) as client:
+            path = f"/api/projects/{own.id}/memory"
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert [x["key"] for x in response.json()["preferences"]] == ["language"]
+            assert [x["key"] for x in response.json()["recent_runs"]] == ["own-run"]
+            assert (
+                await client.put(path + "/focus", json={"value": {"value": "pricing"}})
+            ).status_code == 200
+            assert {x["key"] for x in (await client.get(path)).json()["preferences"]} == {
+                "language",
+                "focus",
+            }
+            assert (await client.delete(path + "/foreign-kind")).status_code == 404
+            assert await store.aget(preferences, "foreign-kind") is not None
+            assert await store.aget(preferences + ("foreign",), "child-0") is not None
+
+            async def refuse_incomplete(*args, **kwargs):
+                raise MemoryLimitError("Fixture: namespace exceeds the bounded scan")
+
+            monkeypatch.setattr(memory, "load_context", refuse_incomplete)
+            response = await client.get(path)
+            assert response.status_code == 409 and "bounded scan" in response.json()["detail"]

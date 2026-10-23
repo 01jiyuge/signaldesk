@@ -7,7 +7,7 @@
 
 Evidence-first competitive intelligence agents with durable workflows, project memory, hybrid retrieval, Docker Sandbox and A2A interoperability.
 
-当前版本 **0.4.4**：统一异常 Bearer 与事件游标边界，回收项目锁；live 未变化来源可补齐缺失向量，报告保存与旧报告导出增加安全校验；控制台保护恢复后的状态和搜索结果，A2A 补充整体调用预算与已确认结果保留。详见 [本轮说明](docs/V0.4.4_UPGRADE.md)。
+当前版本 **0.4.5**：研究历史改为不含报告的轻量游标分页，详情按需读取，独立返回页外活动任务；旧库补建历史索引，启动恢复仅扫描活动任务；项目记忆完善精确命名空间、类别配额和有界完整扫描。详见 [本轮说明](docs/V0.4.5_UPGRADE.md)。
 
 ## 本地启动
 
@@ -28,6 +28,7 @@ Northstar / Orbit 是虚构夹具，demo 不访问外网、不调用模型。
 ## 已实现
 
 - 中文控制台：项目与来源编辑、后台运行、取消/恢复、报告历史、引用与 Markdown/JSON 导出。
+- 研究历史首屏 20 条，支持加载更多；轻量摘要不含报告，已选记录按需读取详情，页外活动任务独立保持可见。
 - LangGraph 五阶段图：采集 → 对比 → Deep Agents 研究 → 引用一致性校验 → 保存。
 - LangChain 工具与应用 Skills；可接入显式白名单的 MCP，只读 stdio MCP 服务可独立启动。
 - 默认 SQLite；PostgreSQL 业务库、checkpointer、官方 AsyncPostgresStore 与 pgvector 已在独立本地库验证。
@@ -54,6 +55,7 @@ AG-UI 当前是业务任务的标准事件投影，未实现通用 `RunAgentInpu
 - [架构、API 与项目目录](docs/ARCHITECTURE.md)
 - [分阶段实施与当前状态](docs/ROADMAP.md)
 - [启动、配置和评测](docs/OPERATIONS.md)
+- [V0.4.5 轻量历史与记忆范围](docs/V0.4.5_UPGRADE.md)
 - [V0.4.4 状态、索引与协议收尾](docs/V0.4.4_UPGRADE.md)
 - [V0.4.3 采集、检索与交互边界](docs/V0.4.3_UPGRADE.md)
 - [V0.4.2 历史分页与生命周期](docs/V0.4.2_UPGRADE.md)
@@ -72,7 +74,7 @@ uv run signaldesk-mcp
 docker compose up --build
 ```
 
-V0.4.4 完整 Python 回归 **427 项通过**，包括真实 PostgreSQL 的 **9 项**和真实 Docker 的 **3 项**集成测试；前端行为测试 **19/19 通过**。独立 HTTP 服务与浏览器验证了修改搜索词后旧查询失效、新查询结果正确；A2A 慢流通过两个真实 HTTP 实例验证。离线评测仍为 **9/9 场景、55/55 项期望匹配**。历史验证见 [V0.4.3 说明](docs/V0.4.3_UPGRADE.md)。
+V0.4.5 完整 Python 回归 **457 项通过**，包含真实 PostgreSQL **11 项**和真实 Docker **3 项**；前端行为测试 **32/32 通过**，离线评测 **9/9 场景、55/55 项期望匹配**。27 条合成历史记录的浏览器验收覆盖首屏 20 条、加载至 27 条、页外旧选择重载恢复和后台任务完成后解锁。相同夹具的历史列表响应由旧接口约 **2.63 MB** 降至分页摘要约 **5.8 KB**，选中报告另行按需读取；这只比较历史列表响应，不代表整个页面流量或耗时。历史验证见 [V0.4.4 说明](docs/V0.4.4_UPGRADE.md)。
 GitHub Actions 已新增 PostgreSQL 与 Docker 真实集成任务；fork PR 保留离线检查。各次提交的实际结果见 [Actions](https://github.com/01jiyuge/signaldesk/actions/workflows/ci.yml)。
 没有使用真实模型、嵌入或远端 Reranker 密钥，也未上传 LangSmith；这些服务的效果仍需配置后验收。
 Docker 隔离与双实例 A2A 已实际运行。Compose 默认不开放 Docker socket，容器内 app 不自动获得宿主执行器权限；Sandbox 可先按原生 Python + Docker 路径运行。

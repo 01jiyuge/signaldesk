@@ -397,22 +397,54 @@ class ProjectMemory:
             "updated_at": item.updated_at.isoformat(),
         }
 
+    @staticmethod
+    def _owns(item: Item, namespace: tuple[str, ...], kind: str, source: str) -> bool:
+        return (
+            item.namespace == namespace
+            and item.value.get("kind") == kind
+            and item.value.get("source") == source
+        )
+
+    async def _scan_exact(self, namespace: tuple[str, ...], kind: str, source: str) -> list[Item]:
+        # BaseStore search is a prefix operation. Fetch a complete bounded
+        # window before filtering: descendants must not consume our quota, and
+        # an overflow/reduced limit must still return the newest owned records.
+        # Official PG Store does not break updated_at ties by key, so OFFSET
+        # pages can overlap. Grow the first window instead of trusting tie order.
+        base = self.max_items + 64
+        maximum = 8 * base + 1
+        window = base
+        while True:
+            page = await self.store.asearch(
+                namespace,
+                filter={"kind": kind, "source": source},
+                limit=window,
+                offset=0,
+            )
+            identities = {(item.namespace, item.key) for item in page}
+            if len(identities) != len(page) or len(page) > window:
+                raise MemoryLimitError("记忆命名空间读取未取得稳定进展，请检查 Store 状态后重试。")
+            if len(page) < window:
+                return sorted(
+                    (item for item in page if self._owns(item, namespace, kind, source)),
+                    key=lambda item: (item.updated_at, item.key),
+                    reverse=True,
+                )
+            if window == maximum:
+                raise MemoryLimitError(
+                    "记忆命名空间包含过多外来记录或历史溢出，无法完整读取；请检查 Store 命名空间。"
+                )
+            window = min(window * 2 + 1, maximum)
+
     async def list_preferences(self, project_id: str) -> list[dict]:
         namespace = self._namespace(project_id, "preferences")
-        items = await self.store.asearch(
-            namespace,
-            filter={"kind": "preference", "source": "user"},
-            limit=self.max_items,
-        )
-        return [self._record(item) for item in items if item.namespace == namespace]
+        items = await self._scan_exact(namespace, "preference", "user")
+        return [self._record(item) for item in items[: self.max_items]]
 
     async def get_preference(self, project_id: str, key: str) -> dict | None:
-        item = await self.store.aget(self._namespace(project_id, "preferences"), self._key(key))
-        if (
-            item is None
-            or item.value.get("kind") != "preference"
-            or item.value.get("source") != "user"
-        ):
+        namespace = self._namespace(project_id, "preferences")
+        item = await self.store.aget(namespace, self._key(key))
+        if item is None or not self._owns(item, namespace, "preference", "user"):
             return None
         return self._record(item)
 
@@ -421,8 +453,10 @@ class ProjectMemory:
         key, value = self._key(key), self._value(value)
         async with self._locks.setdefault(project_id, asyncio.Lock()):
             existing = await self.store.aget(namespace, key)
+            if existing is not None and not self._owns(existing, namespace, "preference", "user"):
+                raise MemoryValidationError("该记忆 key 已由其他类别记录使用，请改用新的 key。")
             if existing is None:
-                items = await self.store.asearch(namespace, limit=self.max_items + 1)
+                items = await self._scan_exact(namespace, "preference", "user")
                 if len(items) >= self.max_items:
                     raise MemoryLimitError(
                         f"每个项目最多保存 {self.max_items} 条明确偏好，请先删除旧条目。"
@@ -436,7 +470,7 @@ class ProjectMemory:
         namespace, key = self._namespace(project_id, "preferences"), self._key(key)
         async with self._locks.setdefault(project_id, asyncio.Lock()):
             existing = await self.store.aget(namespace, key)
-            if existing is None:
+            if existing is None or not self._owns(existing, namespace, "preference", "user"):
                 return False
             await self.store.adelete(namespace, key)
             return True
@@ -519,16 +553,7 @@ class ProjectMemory:
             raise MemoryValidationError("上下文条数须介于 1 和 1000 之间。")
         limit = min(limit, self.max_items)
         namespace = self._namespace(project_id, "runs")
-        items = await self.store.asearch(
-            namespace,
-            filter={"kind": "run_summary", "source": "verified_run"},
-            limit=self.max_items,
-        )
-        items = sorted(
-            (item for item in items if item.namespace == namespace),
-            key=lambda item: item.updated_at,
-            reverse=True,
-        )[:limit]
+        items = (await self._scan_exact(namespace, "run_summary", "verified_run"))[:limit]
         return {
             "preferences": await self.list_preferences(project_id),
             "recent_runs": [self._record(item) for item in items],

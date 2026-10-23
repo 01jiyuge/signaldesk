@@ -5,6 +5,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
+from signaldesk.history import HistoryPage
+
 Mode = Literal["demo", "live"]
 Status = Literal["queued", "running", "interrupted", "completed", "failed", "cancelled"]
 
@@ -63,6 +65,22 @@ class RunRead(BaseModel):
     report: dict | None = None
     created_at: str
     updated_at: str
+
+
+class RunSummaryRead(BaseModel):
+    id: str
+    project_id: str
+    mode: Mode
+    demo_revision: int
+    status: Status
+    stage: str
+    error: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class RunHistoryPage(HistoryPage[RunSummaryRead]):
+    active_run: RunSummaryRead | None
 
 
 class EventRead(BaseModel):

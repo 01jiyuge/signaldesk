@@ -148,12 +148,11 @@ class JobManager:
         await self.repo.append_event(run_id, "cancelled", "Run cancelled by the user")
 
     async def recover_interrupted(self) -> None:
-        for run in await self.repo.list_runs():
-            if run.status in ("queued", "running"):
-                await self.repo.update_run(run.id, status="interrupted")
-                await self.repo.append_event(
-                    run.id, "interrupted", "Previous process stopped; resume this run explicitly"
-                )
+        for run in await self.repo.list_active_runs():
+            await self.repo.update_run(run.id, status="interrupted")
+            await self.repo.append_event(
+                run.id, "interrupted", "Previous process stopped; resume this run explicitly"
+            )
 
     async def shutdown(self) -> None:
         self._closing = True
