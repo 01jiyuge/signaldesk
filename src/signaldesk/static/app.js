@@ -970,15 +970,19 @@
 
   function resumePreviousExtension(context, kind) {
     const operation = context[kind]; const record = operation.record;
-    const active = kind === "sandbox" ? sandboxActive.has(String(record?.status).toLowerCase()) : delegationActive.has(record?.status);
-    if (record?.id && active) operation.timer = setTimeout(() => observeExtension(context, kind, record.id), 4000);
+    if (shouldObserveExtension(kind, record) && operation.selectedId === record.id) operation.timer = setTimeout(() => observeExtension(context, kind, record.id), 4000);
+  }
+
+  function stopExtensionWatch(operation) {
+    operation.watchEpoch++; clearTimeout(operation.timer); operation.timer = null;
+    operation.controller?.abort(); operation.controller = null; operation.watchId = null;
   }
 
   function stopExtensionObservers() {
     if (!extensions.context) return;
     for (const name of ["sandbox", "a2a"]) {
-      const task = extensions.context[name]; task.watchEpoch++;
-      clearTimeout(task.timer); task.timer = null; task.controller?.abort(); task.controller = null;
+      const task = extensions.context[name]; stopExtensionWatch(task);
+      task.listEpoch++; task.listController?.abort(); task.listController = null;
     }
   }
 
@@ -1033,7 +1037,9 @@
     $("sandbox-link-run").disabled = !state.run || state.run.project_id !== state.project?.id;
     for (const name of ["sandbox", "a2a"]) {
       $("cancel-" + name).disabled = !context || context[name].busy || state.disconnected;
-      $("refresh-" + name).disabled = !context || context[name].busy || state.disconnected;
+      $("refresh-" + name).disabled = !context || context[name].busy || context[name].listLoading || state.disconnected;
+      $(name + "-history").disabled = !context || context[name].busy;
+      $("load-more-" + name).disabled = !context || context[name].busy || context[name].listLoading || state.disconnected;
     }
   }
 
@@ -1075,21 +1081,71 @@
     return block;
   }
 
+  function extensionSubmittedAt(record, compact = true) {
+    return record?.created_at && Number.isFinite(Date.parse(record.created_at)) ? dateTime(record.created_at, compact, !compact) : "提交时间未知";
+  }
+
+  function renderExtensionHistory(context, kind) {
+    const operation = context[kind]; const select = $(kind + "-history");
+    const options = operation.records.map((record) => {
+      const label = `${extensionSubmittedAt(record)} · ${kind === "a2a" ? (record.remote || "Agent") + " · " : ""}${taskLabel(record.status, kind)} · ${String(record.id).slice(0, 8)}`;
+      const option = node("option", "", label); option.value = record.id; option.selected = record.id === operation.selectedId; return option;
+    });
+    if (operation.selectedId && !operation.records.some((record) => record.id === operation.selectedId)) {
+      const option = node("option", "", `先前选择 · ${operation.selectedId.slice(0, 8)}（详情未加载）`);
+      option.value = operation.selectedId; option.selected = true; options.unshift(option);
+    }
+    select.hidden = !options.length; select.replaceChildren(...options);
+    select.disabled = operation.busy; select.setAttribute("aria-busy", String(operation.listLoading));
+    const status = operation.listLoading ? (operation.listMode === "more" ? "正在加载更多历史…" : "正在读取历史…") : !operation.historyLoaded ? (operation.listError ? "历史读取失败，可点击刷新重试。" : "等待读取历史。") : `已加载 ${operation.historyIds.length} 条历史${operation.hasMore ? " · 可继续加载" : " · 已到末尾"}${operation.selectedId && !operation.historyIds.includes(operation.selectedId) ? " · 另保留当前选择" : ""}`;
+    if ($(kind + "-history-status").textContent !== status) $(kind + "-history-status").textContent = status;
+    $(kind + "-history-error").textContent = operation.listError; $(kind + "-history-error").hidden = !operation.listError;
+    const more = $("load-more-" + kind); more.hidden = !operation.hasMore;
+    more.textContent = operation.listLoading && operation.listMode === "more" ? "加载中…" : operation.listError && operation.listMode === "more" ? "重试加载更多" : "加载更多";
+  }
+
+  function shouldObserveExtension(kind, record) {
+    if (!record?.id) return false;
+    return kind === "sandbox" ? sandboxActive.has(String(record.status).toLowerCase()) : !!record.task?.id && delegationActive.has(record.status);
+  }
+
+  function renderExtension(context, kind) { if (kind === "sandbox") renderSandbox(context); else renderDelegation(context); }
+
+  function ensureExtensionObservation(context, kind) {
+    const operation = context[kind]; const record = operation.record;
+    if (!shouldObserveExtension(kind, record)) { if (operation.watchId) stopExtensionWatch(operation); return; }
+    if (operation.watchId !== record.id) observeExtension(context, kind, record.id);
+  }
+
+  function keepExtensionRecords(operation, records) {
+    const known = new Map(operation.records.map((record) => [record.id, record]));
+    for (const record of records) known.set(record.id, record);
+    if (operation.record) known.set(operation.record.id, operation.record);
+    operation.records = operation.historyIds.map((id) => known.get(id)).filter(Boolean);
+    if (operation.record && !operation.historyIds.includes(operation.record.id)) operation.records.unshift(operation.record);
+  }
+
+  function selectExtensionRecord(context, kind, record, persist = true) {
+    if (!isExtensionCurrent(context)) return;
+    const operation = context[kind];
+    if (operation.selectedId !== record.id) stopExtensionWatch(operation);
+    operation.selectionEpoch++; operation.selectedId = record.id; operation.record = record; operation.error = "";
+    keepExtensionRecords(operation, [record]);
+    if (persist) saveExtensionStorage(context.projectId, { [kind === "sandbox" ? "sandboxId" : "a2aId"]: record.id });
+    renderExtension(context, kind); ensureExtensionObservation(context, kind);
+  }
+
   function renderSandbox(context) {
     if (!isExtensionCurrent(context)) return;
     const task = context.sandbox; const record = task.record;
     $("sandbox-task-error").textContent = task.error;
     $("sandbox-task-error").hidden = !task.error;
-    $("sandbox-history").hidden = !task.records.length;
-    $("sandbox-history").replaceChildren(...task.records.map((execution) => {
-      const option = node("option", "", `${dateTime(execution.created_at || execution.updated_at, true)} · ${taskLabel(execution.status, "sandbox")} · ${String(execution.id).slice(0, 8)}`);
-      option.value = execution.id; option.selected = execution.id === record?.id; return option;
-    }));
+    renderExtensionHistory(context, "sandbox");
     const container = $("sandbox-result"); container.replaceChildren();
     $("cancel-sandbox").hidden = !record || !sandboxActive.has(String(record.status).toLowerCase());
     $("cancel-sandbox").disabled = task.busy || state.disconnected;
     $("refresh-sandbox").disabled = task.busy;
-    if (!record) { container.append(node("p", "extension-empty", "尚未提交沙箱任务。只有实际执行后，这里才会出现结果。")); renderExtensionAvailability(); return; }
+    if (!record) { container.append(node("p", "extension-empty", task.selectedId ? "先前选择的执行详情尚未读取，可刷新恢复或选择其他记录。" : task.listLoading || !task.historyLoaded ? "正在读取沙箱执行历史。" : "尚未提交沙箱任务。只有实际执行后，这里才会出现结果。")); renderExtensionAvailability(); return; }
     const heading = node("div", "extension-result-heading");
     const statusClass = ["failed", "timed_out", "timeout"].includes(record.status) ? "failed" : ["output_limited", "interrupted"].includes(record.status) ? "interrupted" : ["cancelled", "canceled"].includes(record.status) ? "cancelled" : sandboxActive.has(String(record.status).toLowerCase()) ? "running" : record.status === "completed" ? "completed" : "unknown";
     heading.append(node("span", `status-badge ${statusClass}`, taskLabel(record.status, "sandbox")), node("span", "extension-task-id", `执行 ${String(record.id).slice(0, 8)}`)); container.append(heading);
@@ -1114,19 +1170,16 @@
     const operation = context.a2a; const record = operation.record;
     $("a2a-task-error").textContent = operation.error;
     $("a2a-task-error").hidden = !operation.error;
-    $("a2a-history").hidden = !operation.records.length;
-    $("a2a-history").replaceChildren(...operation.records.map((delegation) => {
-      const option = node("option", "", `${delegation.remote || "Agent"} · ${taskLabel(delegation.status, "a2a")} · ${String(delegation.id).slice(0, 8)}`);
-      option.value = delegation.id; option.selected = delegation.id === record?.id; return option;
-    }));
+    renderExtensionHistory(context, "a2a");
     $("cancel-a2a").hidden = !record?.task?.id || !delegationActive.has(record.status);
     $("cancel-a2a").disabled = operation.busy || state.disconnected;
     $("refresh-a2a").disabled = operation.busy;
     const container = $("a2a-result"); container.replaceChildren();
-    if (!record) { container.append(node("p", "extension-empty", "尚未提交远端委托。这里仅展示服务端返回的实际任务状态和结果。")); renderExtensionAvailability(); return; }
+    if (!record) { container.append(node("p", "extension-empty", operation.selectedId ? "先前选择的委托详情尚未读取，可刷新恢复或选择其他记录。" : operation.listLoading || !operation.historyLoaded ? "正在读取本地委托历史。" : "尚未提交远端委托。这里仅展示服务端返回的实际任务状态和结果。")); renderExtensionAvailability(); return; }
     const heading = node("div", "extension-result-heading");
     const statusClass = ["TASK_STATE_FAILED", "TASK_STATE_REJECTED"].includes(record.status) ? "failed" : record.status === "TASK_STATE_CANCELED" ? "cancelled" : delegationActive.has(record.status) ? "running" : record.status === "TASK_STATE_COMPLETED" ? "completed" : ["TASK_STATE_AUTH_REQUIRED", "TASK_STATE_INPUT_REQUIRED"].includes(record.status) ? "interrupted" : "unknown";
     heading.append(node("span", `status-badge ${statusClass}`, taskLabel(record.status, "a2a")), node("span", "extension-task-id", `委托 ${String(record.id).slice(0, 8)}`)); container.append(heading);
+    container.append(node("p", "extension-result-meta", record.created_at && Number.isFinite(Date.parse(record.created_at)) ? `提交时间：${extensionSubmittedAt(record, false)}` : "提交时间未知（历史记录）"));
     container.append(node("p", "extension-result-meta", `Agent：${record.remote || "未提供"} · 远端项目：${record.remote_project_id || "未提供"}`));
     const task = record.task && typeof record.task === "object" ? record.task : {};
     if (task.id) container.append(node("p", "extension-result-meta", `远端 Task：${task.id}`));
@@ -1156,70 +1209,95 @@
 
   async function observeExtension(context, kind, id) {
     if (!isExtensionCurrent(context)) return;
-    const operation = context[kind]; const ticket = ++operation.watchEpoch;
-    clearTimeout(operation.timer); operation.controller?.abort();
-    if (kind === "a2a" && operation.record?.id === id && (operation.record.status === "PENDING" || !operation.record.task?.id)) { renderDelegation(context); return; }
+    const operation = context[kind]; if (operation.selectedId !== id) return;
+    const ticket = ++operation.watchEpoch;
+    clearTimeout(operation.timer); operation.timer = null; operation.controller?.abort();
+    if (!shouldObserveExtension(kind, operation.record)) { operation.watchId = null; return; }
+    operation.watchId = id;
     const controller = new AbortController(); operation.controller = controller;
     const path = kind === "sandbox" ? `/projects/${encodeURIComponent(context.projectId)}/sandbox/executions/${encodeURIComponent(id)}` : `/a2a/delegations/${encodeURIComponent(id)}`;
     try {
       const record = await api(path, { signal: controller.signal });
-      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch) return;
-      if (!record || record.id !== id || (record.project_id && record.project_id !== context.projectId)) throw new Error("服务返回的任务标识不匹配，已停止观察。");
+      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch || operation.selectedId !== id) return;
+      if (!record || record.id !== id || record.project_id !== context.projectId) throw Object.assign(new Error("服务返回的任务标识不匹配，已停止观察。"), { stopWatching: true });
       operation.record = record; operation.error = "";
-      const index = operation.records.findIndex((item) => item.id === id);
-      if (index >= 0) operation.records[index] = record; else operation.records.unshift(record);
-      if (kind === "sandbox") {
-        renderSandbox(context);
-      } else renderDelegation(context);
-      const active = kind === "sandbox" ? sandboxActive.has(String(record.status).toLowerCase()) : delegationActive.has(record.status);
-      if (active) operation.timer = setTimeout(() => observeExtension(context, kind, id), 2000);
+      keepExtensionRecords(operation, [record]); renderExtension(context, kind);
+      if (shouldObserveExtension(kind, record)) operation.timer = setTimeout(() => observeExtension(context, kind, id), 2000);
+      else operation.watchId = null;
     } catch (error) {
-      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch || error.name === "AbortError") return;
-      operation.error = `任务状态暂时无法更新：${error.message}${error.status === 404 ? "" : " 4 秒后重试，不会自动取消任务。"}`;
-      if (kind === "sandbox") renderSandbox(context); else renderDelegation(context);
-      if (error.status !== 404) operation.timer = setTimeout(() => observeExtension(context, kind, id), 4000);
+      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch || operation.selectedId !== id || error.name === "AbortError") return;
+      const retry = !error.stopWatching && ![400, 401, 403, 404, 409, 422].includes(error.status);
+      operation.error = `任务状态暂时无法更新：${error.message}${retry ? " 4 秒后重试，不会自动取消任务。" : ""}`;
+      renderExtension(context, kind);
+      if (retry) operation.timer = setTimeout(() => observeExtension(context, kind, id), 4000);
+      else operation.watchId = null;
+    } finally {
+      if (ticket === operation.watchEpoch) operation.controller = null;
     }
   }
 
-  async function loadSandboxExecutions(context) {
+  function extensionLocalPath(context, kind) {
+    return `/projects/${encodeURIComponent(context.projectId)}/${kind === "sandbox" ? "sandbox/executions" : "a2a/delegations"}`;
+  }
+
+  async function loadExtensionHistory(context, kind, more = false) {
     if (!isExtensionCurrent(context)) return;
-    const operation = context.sandbox; const ticket = ++operation.watchEpoch;
-    clearTimeout(operation.timer); operation.controller?.abort();
-    const controller = new AbortController(); operation.controller = controller;
+    const operation = context[kind];
+    if (more && (operation.listLoading || !operation.hasMore || !operation.nextCursor)) return;
+    const ticket = ++operation.listEpoch; operation.listController?.abort();
+    const controller = new AbortController(); operation.listController = controller;
+    const requestedCursor = more ? operation.nextCursor : null;
+    const selectedAtStart = operation.record; const selectionAtStart = operation.selectionEpoch;
+    operation.listLoading = true; operation.listMode = more ? "more" : "refresh"; operation.listError = "";
+    renderExtension(context, kind);
+    const current = () => isExtensionCurrent(context) && ticket === operation.listEpoch;
     try {
-      const response = await api(`/projects/${encodeURIComponent(context.projectId)}/sandbox/executions`, { signal: controller.signal });
-      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch) return;
-      operation.records = collection(response, "executions").filter((record) => record && typeof record.id === "string" && record.project_id === context.projectId); operation.error = "";
-      const saved = extensionStorage(context.projectId).sandboxId;
-      const selected = operation.records.find((record) => record.id === operation.record?.id || record.id === saved) || operation.records[0];
-      operation.record = selected || null; renderSandbox(context);
-      if (selected) observeExtension(context, "sandbox", selected.id);
+      const response = await api(`${extensionLocalPath(context, kind)}/page?limit=20${requestedCursor ? "&cursor=" + encodeURIComponent(requestedCursor) : ""}`, { signal: controller.signal });
+      if (!current()) return;
+      if (!Array.isArray(response?.items) || typeof response.has_more !== "boolean" || (response.has_more && (typeof response.next_cursor !== "string" || !response.next_cursor || response.next_cursor === requestedCursor))) throw new Error("服务返回的历史分页格式或游标无效，已保留当前记录。");
+      const items = response.items;
+      if (items.some((record) => !record || typeof record.id !== "string" || record.project_id !== context.projectId)) throw new Error("历史记录的项目标识不匹配，已拒绝载入。");
+      if (operation.record === selectedAtStart && operation.selectionEpoch === selectionAtStart) {
+        const updated = items.find((record) => record.id === operation.selectedId);
+        if (updated) operation.record = updated;
+      }
+      operation.historyIds = [...new Set([...(more ? operation.historyIds : []), ...items.map((record) => record.id)])];
+      operation.nextCursor = response.has_more ? response.next_cursor : null; operation.hasMore = response.has_more; operation.historyLoaded = true;
+      keepExtensionRecords(operation, items); renderExtension(context, kind);
+      if (operation.record) { ensureExtensionObservation(context, kind); return; }
+      const selectedId = operation.selectedId;
+      const loaded = operation.records.find((record) => record.id === selectedId);
+      if (loaded) { selectExtensionRecord(context, kind, loaded); return; }
+      if (!selectedId) { if (operation.records[0]) selectExtensionRecord(context, kind, operation.records[0]); return; }
+      const selectionTicket = operation.selectionEpoch;
+      try {
+        const record = await api(`${extensionLocalPath(context, kind)}/${encodeURIComponent(selectedId)}`, { signal: controller.signal });
+        if (!current() || operation.selectionEpoch !== selectionTicket || operation.selectedId !== selectedId) return;
+        if (!record || record.id !== selectedId || record.project_id !== context.projectId) throw new Error("先前选择的任务不属于当前项目，已拒绝载入。");
+        selectExtensionRecord(context, kind, record);
+      } catch (error) {
+        if (!current() || operation.selectionEpoch !== selectionTicket || operation.selectedId !== selectedId || error.name === "AbortError") return;
+        operation.listError = `暂时无法恢复先前选择：${error.message} 已加载的历史仍可查看。`;
+        if (error.status === 404) {
+          operation.selectedId = null;
+          saveExtensionStorage(context.projectId, { [kind === "sandbox" ? "sandboxId" : "a2aId"]: null });
+          if (operation.records[0]) selectExtensionRecord(context, kind, operation.records[0]);
+        }
+      }
     } catch (error) {
-      if (isExtensionCurrent(context) && ticket === operation.watchEpoch && error.name !== "AbortError") { operation.error = `暂时无法读取执行记录：${error.status === 404 ? "当前服务尚未提供沙箱执行接口。" : error.message}`; renderSandbox(context); }
+      if (current() && error.name !== "AbortError") operation.listError = `暂时无法${more ? "加载更多" : "读取"}历史：${[404, 405].includes(error.status) ? "当前服务尚未提供历史分页接口，请更新服务后刷新。" : error.message} 已加载记录与当前任务观察保持不变。`;
+    } finally {
+      if (current()) { operation.listLoading = false; operation.listController = null; renderExtension(context, kind); }
     }
   }
 
-  async function loadDelegations(context) {
-    if (!isExtensionCurrent(context)) return;
-    const operation = context.a2a; const ticket = ++operation.watchEpoch;
-    clearTimeout(operation.timer); operation.controller?.abort();
-    const controller = new AbortController(); operation.controller = controller;
-    try {
-      const response = await api(`/projects/${encodeURIComponent(context.projectId)}/a2a/delegations?limit=100&offset=0`, { signal: controller.signal });
-      if (!isExtensionCurrent(context) || ticket !== operation.watchEpoch) return;
-      operation.records = collection(response, "delegations").filter((record) => record && typeof record.id === "string" && record.project_id === context.projectId); operation.error = "";
-      const saved = extensionStorage(context.projectId).a2aId;
-      const selected = operation.records.find((record) => record.id === operation.record?.id) || operation.records.find((record) => record.id === saved) || operation.records[0];
-      operation.record = selected || null; renderDelegation(context);
-      if (selected?.task?.id && selected.status !== "PENDING") observeExtension(context, "a2a", selected.id);
-    } catch (error) {
-      if (isExtensionCurrent(context) && ticket === operation.watchEpoch && error.name !== "AbortError") { operation.error = `暂时无法读取委托记录：${[404, 405].includes(error.status) ? "当前服务尚未提供委托历史接口，请更新服务后刷新。" : error.message}`; renderDelegation(context); }
-    }
-  }
+  function loadSandboxExecutions(context, more = false) { return loadExtensionHistory(context, "sandbox", more); }
+  function loadDelegations(context, more = false) { return loadExtensionHistory(context, "a2a", more); }
 
   function loadExtensionProject(projectId) {
-    const operation = () => ({ record: null, records: [], busy: false, timer: null, controller: null, watchEpoch: 0, error: "" });
-    const context = { projectId, sandbox: operation(), a2a: operation() };
+    const saved = extensionStorage(projectId);
+    const operation = (selectedId) => ({ record: null, selectedId: typeof selectedId === "string" ? selectedId : null, records: [], historyIds: [], busy: false, timer: null, controller: null, watchEpoch: 0, watchId: null, selectionEpoch: 0, error: "", listController: null, listEpoch: 0, listLoading: false, listMode: "refresh", listError: "", historyLoaded: false, nextCursor: null, hasMore: false });
+    const context = { projectId, sandbox: operation(saved.sandboxId), a2a: operation(saved.a2aId) };
     extensions.context = context;
     $("sandbox-form").reset(); $("a2a-form").reset(); $("a2a-project").value = ""; $("a2a-project").dataset.defaultRemote = "";
     $("a2a-revision-wrap").hidden = false;
@@ -1239,7 +1317,7 @@
     if (!payload.code.trim()) { operation.error = "请先填写 Python 代码。"; renderSandbox(context); return; }
     if ($("sandbox-link-run").checked && state.run?.project_id === context.projectId) payload.run_id = state.run.id;
     const submission = beginExtensionSubmission(context, "sandbox");
-    operation.watchEpoch++; clearTimeout(operation.timer); operation.controller?.abort();
+    stopExtensionWatch(operation);
     operation.busy = true; renderSandbox(context);
     try {
       const record = await api(`/projects/${encodeURIComponent(context.projectId)}/sandbox/executions`, { method: "POST", body: JSON.stringify(payload) });
@@ -1247,8 +1325,7 @@
       if (extensions.submissions.get(`${context.projectId}:sandbox`) !== submission) return;
       saveExtensionStorage(context.projectId, { sandboxId: record.id });
       const current = currentExtensionSubmission(context, "sandbox", submission); if (!current) return;
-      current.sandbox.record = record; current.sandbox.records.unshift(record); renderSandbox(current);
-      observeExtension(current, "sandbox", record.id);
+      selectExtensionRecord(current, "sandbox", record);
     } catch (error) {
       const current = currentExtensionSubmission(context, "sandbox", submission);
       if (current) { current.sandbox.error = `执行请求未完成：${error.message}`; renderSandbox(current); if (current === context) resumePreviousExtension(current, "sandbox"); }
@@ -1266,7 +1343,7 @@
     payload.message_id = saved.a2aPending?.fingerprint === fingerprint ? saved.a2aPending.messageId : crypto.randomUUID();
     saveExtensionStorage(context.projectId, { a2aPending: { fingerprint, messageId: payload.message_id } });
     const submission = beginExtensionSubmission(context, "a2a");
-    operation.watchEpoch++; clearTimeout(operation.timer); operation.controller?.abort();
+    stopExtensionWatch(operation);
     operation.busy = true; renderDelegation(context);
     try {
       const record = await api(`/projects/${encodeURIComponent(context.projectId)}/a2a/delegations`, { method: "POST", body: JSON.stringify(payload) });
@@ -1274,10 +1351,7 @@
       if (extensions.submissions.get(`${context.projectId}:a2a`) !== submission) return;
       saveExtensionStorage(context.projectId, { a2aId: record.id, ...(record.task?.id && record.status !== "PENDING" ? { a2aPending: null } : {}) });
       const current = currentExtensionSubmission(context, "a2a", submission); if (!current) return;
-      current.a2a.record = record;
-      const index = current.a2a.records.findIndex((item) => item.id === record.id);
-      if (index >= 0) current.a2a.records[index] = record; else current.a2a.records.unshift(record);
-      renderDelegation(current); observeExtension(current, "a2a", record.id);
+      selectExtensionRecord(current, "a2a", record);
     } catch (error) {
       const current = currentExtensionSubmission(context, "a2a", submission);
       if (current) { current.a2a.error = `委托请求未完成：${error.message} 相同参数重试将沿用本次请求 ID。`; renderDelegation(current); if (current === context) resumePreviousExtension(current, "a2a"); }
@@ -1289,18 +1363,21 @@
     const context = extensions.context; if (!context) return;
     const operation = context[kind]; const id = operation.record?.id;
     if (!id || operation.busy) return;
-    operation.watchEpoch++; clearTimeout(operation.timer); operation.controller?.abort();
+    stopExtensionWatch(operation);
     operation.busy = true; operation.error = "";
     if (kind === "sandbox") renderSandbox(context); else renderDelegation(context);
     const path = kind === "sandbox" ? `/projects/${encodeURIComponent(context.projectId)}/sandbox/executions/${encodeURIComponent(id)}/cancel` : `/a2a/delegations/${encodeURIComponent(id)}/cancel`;
     try {
-      await api(path, { method: "POST" });
-      if (isExtensionCurrent(context)) await observeExtension(context, kind, id);
+      const record = await api(path, { method: "POST" });
+      if (isExtensionCurrent(context) && operation.selectedId === id) {
+        if (!record || record.id !== id || record.project_id !== context.projectId) throw new Error("取消响应的任务标识不匹配，请刷新确认。");
+        operation.record = record; keepExtensionRecords(operation, [record]); renderExtension(context, kind); ensureExtensionObservation(context, kind);
+      }
     } catch (error) {
-      if (isExtensionCurrent(context)) {
+      if (isExtensionCurrent(context) && operation.selectedId === id) {
         operation.error = `取消请求未完成：${error.message}`; toast(operation.error, true);
         if (kind === "sandbox") renderSandbox(context); else renderDelegation(context);
-        operation.timer = setTimeout(() => observeExtension(context, kind, id), 2000);
+        if (operation.selectedId === id) operation.timer = setTimeout(() => observeExtension(context, kind, id), 2000);
       }
     }
     finally { operation.busy = false; if (isExtensionCurrent(context)) { if (kind === "sandbox") renderSandbox(context); else renderDelegation(context); } }
@@ -1397,19 +1474,19 @@
   $("cancel-a2a").addEventListener("click", () => cancelExtension("a2a"));
   $("refresh-sandbox").addEventListener("click", () => { if (extensions.context) loadSandboxExecutions(extensions.context); });
   $("refresh-a2a").addEventListener("click", () => { if (extensions.context) loadDelegations(extensions.context); });
+  $("load-more-sandbox").addEventListener("click", () => { if (extensions.context) loadSandboxExecutions(extensions.context, true); });
+  $("load-more-a2a").addEventListener("click", () => { if (extensions.context) loadDelegations(extensions.context, true); });
   $("sandbox-history").addEventListener("change", (event) => {
     const context = extensions.context; if (!context) return;
+    if (context.sandbox.busy) return;
     const selected = context.sandbox.records.find((record) => record.id === event.target.value);
-    if (selected) { context.sandbox.record = selected; saveExtensionStorage(context.projectId, { sandboxId: selected.id }); renderSandbox(context); observeExtension(context, "sandbox", selected.id); }
+    if (selected) selectExtensionRecord(context, "sandbox", selected);
   });
   $("a2a-history").addEventListener("change", (event) => {
     const context = extensions.context; if (!context) return;
+    if (context.a2a.busy) return;
     const selected = context.a2a.records.find((record) => record.id === event.target.value);
-    if (selected) {
-      context.a2a.watchEpoch++; clearTimeout(context.a2a.timer); context.a2a.controller?.abort();
-      context.a2a.record = selected; context.a2a.error = ""; saveExtensionStorage(context.projectId, { a2aId: selected.id }); renderDelegation(context);
-      if (selected.task?.id && selected.status !== "PENDING") observeExtension(context, "a2a", selected.id);
-    }
+    if (selected) selectExtensionRecord(context, "a2a", selected);
   });
   $("a2a-remote").addEventListener("change", () => {
     const selected = extensions.capabilities?.a2a?.remotes?.find((remote) => remote.name === $("a2a-remote").value);

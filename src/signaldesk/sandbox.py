@@ -21,6 +21,7 @@ from sqlalchemy import JSON, DateTime, String, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from signaldesk.config import Settings
+from signaldesk.history import before_position, decode_cursor, history_page
 from signaldesk.repository import Repository
 
 SandboxStatus = Literal[
@@ -544,6 +545,7 @@ class SandboxService:
         self.settings = settings
         self.executor = executor or DockerSandbox(settings)
         self._tasks: dict[str, asyncio.Task] = {}
+        self._start_operations: set[asyncio.Task] = set()
         self._slots = asyncio.Semaphore(settings.sandbox_max_concurrent)
         self._start_lock = asyncio.Lock()
         self._closing = False
@@ -591,6 +593,35 @@ class SandboxService:
                 raise KeyError("此项目下的研究任务不存在。")
 
     async def start(
+        self,
+        project_id: str,
+        code: str,
+        input_data: Any = None,
+        run_id: str | None = None,
+    ) -> SandboxExecutionRead:
+        if self._closing:
+            raise SandboxUnavailableError("Sandbox 正在关闭。")
+        operation = asyncio.create_task(
+            self._start(project_id, code, input_data, run_id),
+            name=f"sandbox-start:{project_id}",
+        )
+        self._start_operations.add(operation)
+        operation.add_done_callback(self._start_operations.discard)
+        cancelled = False
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            if not operation.cancelled():
+                operation.exception()
+            raise asyncio.CancelledError
+        return operation.result()
+
+    async def _start(
         self,
         project_id: str,
         code: str,
@@ -646,6 +677,28 @@ class SandboxService:
         async with self.repo.sessions() as session:
             row = await session.get(SandboxExecution, execution_id)
             return _read(row) if row is not None and row.project_id == project_id else None
+
+    async def page(self, project_id: str, *, limit: int = 20, cursor: str | None = None) -> dict:
+        await self._scope(project_id)
+        position = decode_cursor(cursor, project_id=project_id, resource="sandbox")
+        if not 1 <= limit <= 100:
+            raise ValueError("History page size must be between 1 and 100")
+        query = select(SandboxExecution).where(SandboxExecution.project_id == project_id)
+        if position is not None:
+            query = query.where(
+                before_position(SandboxExecution.created_at, SandboxExecution.id, position)
+            )
+        query = query.order_by(
+            SandboxExecution.created_at.desc(), SandboxExecution.id.desc()
+        ).limit(limit + 1)
+        async with self.repo.sessions() as session:
+            rows = (await session.scalars(query)).all()
+        return history_page(
+            [_read(row).model_dump(mode="json") for row in rows],
+            limit=limit,
+            project_id=project_id,
+            resource="sandbox",
+        )
 
     async def _store(
         self,
@@ -785,15 +838,39 @@ class SandboxService:
         input_data: Any = None,
         run_id: str | None = None,
     ) -> SandboxResult:
-        row = await self.start(project_id, code, input_data, run_id)
-        task = self._tasks.get(row.id)
+        # Keep this same start alive if the tool caller is cancelled before
+        # registration returns. A retry would create another execution, and
+        # cancelling start itself could lose the only handle to a committed row.
+        starting = asyncio.create_task(
+            self.start(project_id, code, input_data, run_id),
+            name=f"sandbox-execute-start:{project_id}",
+        )
+        row = None
         try:
+            row = await asyncio.shield(starting)
+            task = self._tasks.get(row.id)
             if task:
                 await asyncio.shield(task)
         except asyncio.CancelledError:
-            current = await self.get(project_id, row.id)
-            if current and current.status in ACTIVE_STATUSES:
-                await _finish_cleanup(self.cancel(project_id, row.id))
+
+            async def cancel_registered():
+                nonlocal row
+                if row is None:
+                    try:
+                        row = await starting
+                    except Exception:
+                        # A rejected start has no returned execution to cancel;
+                        # preserve the caller's cancellation rather than a
+                        # capacity/closing error from its in-flight validation.
+                        return
+                current = await self.get(project_id, row.id)
+                if current and current.status in ACTIVE_STATUSES:
+                    try:
+                        await self.cancel(project_id, row.id)
+                    except SandboxConflictError:
+                        pass  # Execution finished between the two observations.
+
+            await _finish_cleanup(cancel_registered())
             raise
         finished = await self.get(project_id, row.id)
         return finished.result
@@ -802,6 +879,10 @@ class SandboxService:
         self._closing = True
 
         async def finish():
+            # Starts own validation, commit, and producer registration even when
+            # their HTTP/tool caller disconnects. No later start can register
+            # after the snapshot once _closing is set above.
+            await asyncio.gather(*list(self._start_operations), return_exceptions=True)
             # A start already committing its queued row must finish registering
             # its task before the snapshot. Later starts observe _closing.
             async with self._start_lock:

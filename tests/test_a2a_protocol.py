@@ -657,7 +657,16 @@ async def test_local_delegation_list_restores_pending_history_without_network_or
         assert next(item for item in data if item["status"] == "PENDING")["task"] is None
         assert all(
             set(item)
-            == {"id", "project_id", "run_id", "remote", "remote_project_id", "status", "task"}
+            == {
+                "id",
+                "project_id",
+                "run_id",
+                "remote",
+                "remote_project_id",
+                "status",
+                "task",
+                "created_at",
+            }
             for item in data
         )
         assert (

@@ -2,6 +2,7 @@
 
 import secrets
 from typing import Annotated
+from urllib.parse import unquote_to_bytes
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -45,6 +46,18 @@ def create_memory_router(
             raise HTTPException(503, "项目记忆尚未就绪，请稍后重试。")
         return current
 
+    def checked_key(request: Request, key: str) -> str:
+        # ASGI servers can replace malformed percent-encoded UTF-8 with U+FFFD
+        # in path parameters. Reject malformed wire text rather than silently
+        # saving/deleting a different key. A valid encoded U+FFFD remains valid.
+        raw_path = request.scope.get("raw_path")
+        if raw_path is not None:
+            try:
+                unquote_to_bytes(raw_path).decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise HTTPException(422, "记忆 key 必须是有效 UTF-8 文本。") from exc
+        return key
+
     @router.get("/{project_id}/memory")
     async def list_memory(
         project_id: str, request: Request, limit: int = Query(default=10, ge=1, le=1000)
@@ -56,7 +69,9 @@ def create_memory_router(
     async def get_memory(project_id: str, key: str, request: Request):
         await require_project(project_id)
         try:
-            item = await resolve_memory(request).get_preference(project_id, key)
+            item = await resolve_memory(request).get_preference(
+                project_id, checked_key(request, key)
+            )
         except MemoryValidationError as exc:
             raise HTTPException(422, str(exc)) from exc
         if item is None:
@@ -67,7 +82,9 @@ def create_memory_router(
     async def set_memory(project_id: str, key: str, payload: PreferenceInput, request: Request):
         await require_project(project_id)
         try:
-            return await resolve_memory(request).set_preference(project_id, key, payload.value)
+            return await resolve_memory(request).set_preference(
+                project_id, checked_key(request, key), payload.value
+            )
         except MemoryValidationError as exc:
             raise HTTPException(422, str(exc)) from exc
         except MemoryLimitError as exc:
@@ -77,7 +94,9 @@ def create_memory_router(
     async def delete_memory(project_id: str, key: str, request: Request):
         await require_project(project_id)
         try:
-            deleted = await resolve_memory(request).delete_preference(project_id, key)
+            deleted = await resolve_memory(request).delete_preference(
+                project_id, checked_key(request, key)
+            )
         except MemoryValidationError as exc:
             raise HTTPException(422, str(exc)) from exc
         if not deleted:

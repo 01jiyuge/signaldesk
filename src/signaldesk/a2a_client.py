@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from signaldesk.a2a_server import A2ACommand, authenticate_a2a, validate_endpoint
 from signaldesk.a2a_store import TERMINAL_TASK_STATES, A2ARequestStore, IdempotencyConflict
 from signaldesk.errors import PublicTaskError
+from signaldesk.history import HistoryCursorError, HistoryPage, utc_date
 
 MAX_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024
 SEND_ACK_GRACE_SECONDS = 5
@@ -171,7 +172,7 @@ class A2ADelegate:
 
     @staticmethod
     def _public(record):
-        return {
+        result = {
             key: record[key]
             for key in (
                 "id",
@@ -183,6 +184,10 @@ class A2ADelegate:
                 "task",
             )
         }
+        created = record.get("created_at")
+        if created is not None:
+            created = utc_date(created).isoformat()
+        return {**result, "created_at": created}
 
     async def _registered(self, delegation_id):
         record = await self.bindings.get_delegation(delegation_id)
@@ -318,6 +323,18 @@ class A2ADelegate:
                 project_id, limit=limit, offset=offset
             )
         ]
+
+    async def local_record(self, project_id: str, delegation_id: str) -> dict:
+        if await self.repo.get_project(project_id) is None:
+            raise KeyError(project_id)
+        record = await self.bindings.get_delegation(delegation_id)
+        if record is None or record["project_id"] != project_id:
+            raise KeyError(delegation_id)
+        return self._public(record)
+
+    async def page(self, project_id: str, *, limit: int = 20, cursor: str | None = None) -> dict:
+        page = await self.bindings.page_delegations(project_id, limit=limit, cursor=cursor)
+        return {**page, "items": [self._public(record) for record in page["items"]]}
 
     async def cancel(self, delegation_id: str) -> dict:
         record = await self._registered(delegation_id)
@@ -474,6 +491,17 @@ class DelegateRequest(BaseModel):
     demo_revision: Literal[1, 2] = 1
 
 
+class DelegationRead(BaseModel):
+    id: str
+    project_id: str
+    run_id: str | None
+    remote: str
+    remote_project_id: str
+    status: str
+    task: dict | None
+    created_at: str | None
+
+
 def create_a2a_delegation_router(repo, settings) -> APIRouter:
     router = APIRouter(prefix="/api")
     delegate = A2ADelegate(settings, repo)
@@ -485,6 +513,8 @@ def create_a2a_delegation_router(repo, settings) -> APIRouter:
             raise HTTPException(404, "项目或登记委托不存在。") from exc
         except IdempotencyConflict as exc:
             raise HTTPException(409, "message_id 已绑定不同委托参数。") from exc
+        except HistoryCursorError as exc:
+            raise HTTPException(422, str(exc)) from exc
         except PublicTaskError as exc:
             if exc.code == "a2a_remote_not_found":
                 raise HTTPException(404, str(exc)) from exc
@@ -525,5 +555,24 @@ def create_a2a_delegation_router(repo, settings) -> APIRouter:
     async def cancel(delegation_id: str, request: Request):
         authenticate_a2a(request, settings)
         return await call(delegate.cancel(delegation_id))
+
+    @router.get(
+        "/projects/{project_id}/a2a/delegations/page", response_model=HistoryPage[DelegationRead]
+    )
+    async def page_delegations(
+        project_id: str,
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=512),
+    ):
+        authenticate_a2a(request, settings)
+        return await call(delegate.page(project_id, limit=limit, cursor=cursor))
+
+    @router.get(
+        "/projects/{project_id}/a2a/delegations/{delegation_id}", response_model=DelegationRead
+    )
+    async def local_record(project_id: str, delegation_id: str, request: Request):
+        authenticate_a2a(request, settings)
+        return await call(delegate.local_record(project_id, delegation_id))
 
     return router

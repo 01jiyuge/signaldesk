@@ -1,3 +1,6 @@
+import asyncio
+import json
+import random
 from types import SimpleNamespace
 from typing import TypedDict
 
@@ -251,3 +254,269 @@ async def test_memory_api_resolves_real_lifespan_memory_at_request_time(tmp_path
             }
     finally:
         await repo.close()
+
+
+async def test_reduced_run_capacity_repairs_all_overflow_without_removing_preferences(store):
+    original = ProjectMemory(store, max_items=3)
+    await original.set_preference("alpha", "language", {"language": "中文"})
+    for index in range(1, 4):
+        await original.remember_run("alpha", f"r{index}", {"summary": str(index)})
+    reduced = ProjectMemory(store, max_items=1)
+    await reduced.remember_run("alpha", "r4", {"summary": "4"})
+    await reduced.remember_run("alpha", "r5", {"summary": "5"})
+    assert [item.key for item in await store.asearch(("projects", "alpha", "runs"))] == ["r5"]
+    assert (await reduced.get_preference("alpha", "language"))["value"] == {"language": "中文"}
+
+
+async def test_run_overflow_pagination_repairs_idempotent_retry_over_128_rows(store, monkeypatch):
+    namespace = ("projects", "alpha", "runs")
+    store.batch(
+        [
+            PutOp(
+                namespace,
+                f"r{index:03}",
+                {
+                    "kind": "run_summary",
+                    "source": "verified_run",
+                    "content": {"summary": str(index)},
+                },
+            )
+            for index in range(150)
+        ]
+    )
+    # A Store prefix includes descendants. Neither a descendant nor an explicit
+    # preference record is owned by the run-summary retention policy.
+    await store.aput(
+        namespace + ("other",),
+        "child",
+        {"kind": "run_summary", "source": "verified_run", "content": {"summary": "child"}},
+    )
+    await store.aput(
+        namespace,
+        "foreign-preference",
+        {"kind": "preference", "source": "user", "content": {"text": "keep"}},
+    )
+    memory = ProjectMemory(store, max_items=1)
+    await memory.set_preference("alpha", "language", {"language": "中文"})
+    before = await store.aget(namespace, "r149")
+    searches = []
+    original_search = store.asearch
+
+    async def recorded_search(*args, **kwargs):
+        result = await original_search(*args, **kwargs)
+        searches.append((kwargs.get("limit"), kwargs.get("offset", 0), len(result)))
+        return result
+
+    monkeypatch.setattr(store, "asearch", recorded_search)
+    repeated = await memory.remember_run("alpha", "r149", {"summary": "must not replace"})
+    assert repeated["value"] == {"summary": "149"}
+    assert repeated["updated_at"] == before.updated_at.isoformat()
+    assert len(searches) >= 3 and all(
+        limit == memory.max_items + 64 and size <= memory.max_items + 64
+        for limit, _, size in searches
+    )
+    physical = await original_search(namespace, limit=1000)
+    retained = [
+        item.key
+        for item in physical
+        if item.namespace == namespace and item.value.get("kind") == "run_summary"
+    ]
+    assert retained == ["r149"]
+    assert (await store.aget(namespace + ("other",), "child")) is not None
+    assert (await store.aget(namespace, "foreign-preference")).value["content"] == {"text": "keep"}
+    assert (await memory.get_preference("alpha", "language"))["value"] == {"language": "中文"}
+
+
+async def test_cancelled_run_insert_keeps_lock_until_committed_write_is_pruned(tmp_path):
+    class GatedStore(SQLiteStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.written, self.release = asyncio.Event(), asyncio.Event()
+
+        async def aput(self, namespace, key, value, *args, **kwargs):
+            await super().aput(namespace, key, value, *args, **kwargs)
+            if key == "r2":
+                self.written.set()
+                await self.release.wait()
+
+    instance = GatedStore(tmp_path / "cancelled-summary.db")
+    memory = ProjectMemory(instance, max_items=1)
+    await memory.remember_run("alpha", "r1", {"summary": "1"})
+    pending = asyncio.create_task(memory.remember_run("alpha", "r2", {"summary": "2"}))
+    try:
+        await asyncio.wait_for(instance.written.wait(), 2)
+        pending.cancel()
+        await asyncio.sleep(0)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done() and memory._locks["alpha"].locked()
+        instance.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not memory._locks["alpha"].locked()
+        assert [item.key for item in await instance.asearch(("projects", "alpha", "runs"))] == [
+            "r2"
+        ]
+        await memory.remember_run("alpha", "r3", {"summary": "3"})
+        assert [item.key for item in await instance.asearch(("projects", "alpha", "runs"))] == [
+            "r3"
+        ]
+    finally:
+        instance.release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        instance.close()
+
+
+@pytest.mark.parametrize(
+    "value", [{"text": "\ud800"}, {"\udfff": "invalid key"}, {"nested": {"text": "\udc00"}}]
+)
+async def test_memory_api_invalid_json_unicode_is_422_and_does_not_write(tmp_path, store, value):
+    settings = Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/unicode.db")
+    repo = Repository(settings)
+    await repo.initialize()
+    project = await repo.create_project(
+        ProjectCreate(
+            name="Unicode fixture", sources=[{"name": "Example", "url": "https://example.com"}]
+        )
+    )
+    app = FastAPI()
+    app.include_router(create_memory_router(repo, ProjectMemory(store), settings))
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            path = f"/api/projects/{project.id}/memory"
+            result = await client.put(
+                path + "/language",
+                content=json.dumps({"value": value}, ensure_ascii=True).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            assert result.status_code == 422
+            assert result.json()["detail"] == "记忆内容必须可序列化为标准 JSON。"
+            assert (await client.get(path)).json()["preferences"] == []
+            for method in ("GET", "PUT", "DELETE"):
+                response = await client.request(
+                    method,
+                    path + "/invalid%ED%A0%80",
+                    json={"value": {}} if method == "PUT" else None,
+                )
+                assert response.status_code == 422
+                assert response.json()["detail"] == "记忆 key 必须是有效 UTF-8 文本。"
+            # A literal replacement character is valid UTF-8 and stays editable.
+            valid = await client.put(path + "/valid%EF%BF%BD", json={"value": {"text": "ok"}})
+            assert valid.status_code == 200
+    finally:
+        await repo.close()
+
+
+async def test_memory_facade_rejects_invalid_unicode_key_before_store_access(store):
+    memory = ProjectMemory(store)
+    for operation in (
+        memory.set_preference("alpha", "\ud800", {}),
+        memory.get_preference("alpha", "\udfff"),
+        memory.delete_preference("alpha", "\udc00"),
+    ):
+        with pytest.raises(MemoryValidationError, match="UTF-8"):
+            await operation
+
+
+async def test_sqlite_search_streams_bounded_rows_before_filter_pagination(store):
+    namespace = ("projects", "alpha", "runs")
+    store.batch([PutOp(namespace, f"r{index:03}", {"wanted": index < 2}) for index in range(150)])
+    reads = []
+
+    class BoundedCursor:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def fetchall(self):
+            raise AssertionError("A limited search must not load all rows")
+
+        def fetchmany(self, size):
+            reads.append(size)
+            return self.inner.fetchmany(size)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    class TrackedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            cursor = self.inner.execute(sql, *args)
+            return BoundedCursor(cursor) if sql.startswith("SELECT * FROM store_items") else cursor
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    store._connection = TrackedConnection(store._connection)
+    result = await store.asearch(namespace, filter={"wanted": True}, offset=1, limit=1)
+    assert [item.key for item in result] == ["r000"]
+    assert len(reads) >= 3 and max(reads) <= 64
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 50])
+async def test_run_retention_restarts_bounded_windows_when_timestamp_ties_reorder(
+    tmp_path, capacity
+):
+    class TiedStore(SQLiteStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.searches = []
+
+        async def asearch(self, namespace, *, limit=10, offset=0, **kwargs):
+            # The official PG query orders timestamps without a key tie-breaker.
+            # Reorder equal timestamps on each response to exercise that contract.
+            self.searches.append((limit, offset))
+            rows = await super().asearch(namespace, limit=1000, offset=0, **kwargs)
+            random.Random(400 + len(self.searches)).shuffle(rows)
+            return rows[offset : offset + limit]
+
+    instance = TiedStore(tmp_path / "tied.db")
+    namespace = ("projects", "alpha", "runs")
+    try:
+        instance.batch(
+            [
+                PutOp(
+                    namespace,
+                    f"r{index:03}",
+                    {
+                        "kind": "run_summary",
+                        "source": "verified_run",
+                        "content": {"summary": str(index)},
+                    },
+                )
+                for index in range(150)
+            ]
+        )
+        instance._connection.execute(
+            "UPDATE store_items SET updated_at='2026-10-23T00:00:00+00:00'"
+        )
+        instance._connection.commit()
+        memory = ProjectMemory(instance, max_items=capacity)
+        await memory.remember_run("alpha", "r149", {"summary": "must not replace"})
+        physical = await SQLiteStore.asearch(instance, namespace, limit=1000)
+        assert {item.key for item in physical} == {
+            f"r{index:03}" for index in range(150 - capacity, 150)
+        }
+        assert all(limit == capacity + 64 and offset == 0 for limit, offset in instance.searches)
+    finally:
+        instance.close()
+
+
+async def test_retention_reports_bounded_failure_for_excess_foreign_descendants(store):
+    namespace = ("projects", "alpha", "runs")
+    values = {"kind": "run_summary", "source": "verified_run", "content": {"summary": "keep"}}
+    store.batch([PutOp(namespace, "r1", values), PutOp(namespace, "r2", values)])
+    store.batch(
+        [PutOp(namespace + ("foreign",), f"foreign-{index}", values) for index in range(600)]
+    )
+    memory = ProjectMemory(store, max_items=1)
+    with pytest.raises(MemoryLimitError, match="外来记录"):
+        await memory.remember_run("alpha", "r2", {"summary": "do not overwrite"})
+    rows = await store.asearch(namespace + ("foreign",), limit=1000)
+    assert len(rows) == 600
+    assert (await store.aget(namespace, "r1")) is not None

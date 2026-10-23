@@ -7,11 +7,25 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, ForeignKey, String, Table, insert, select, update
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Table,
+    insert,
+    inspect,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 
 from signaldesk.db import Base, Event, Run, utcnow
 from signaldesk.errors import PublicTaskError
+from signaldesk.history import before_position, decode_cursor, history_page
 from signaldesk.repository import ActiveRunError, Repository, _project, _run
 from signaldesk.schemas import RunCreate, RunRead
 
@@ -52,7 +66,25 @@ delegations = Table(
     Column("remote_project_id", String(128), nullable=False),
     Column("task", JSON, nullable=True),
     Column("status", String(40), nullable=False),
+    # V0.4/0.4.1 rows have no trustworthy creation time; migration leaves NULL.
+    Column("created_at", DateTime(timezone=True), nullable=True),
 )
+history_index = Index(
+    "ix_a2a_delegations_history",
+    delegations.c.project_id,
+    delegations.c.created_at.desc(),
+    delegations.c.id.desc(),
+)
+
+
+def _initialize_tables(connection):
+    requests.create(connection, checkfirst=True)
+    delegations.create(connection, checkfirst=True)
+    columns = {column["name"] for column in inspect(connection).get_columns(delegations.name)}
+    if "created_at" not in columns:
+        datatype = DateTime(timezone=True).compile(dialect=connection.dialect)
+        connection.exec_driver_sql(f"ALTER TABLE a2a_delegations ADD COLUMN created_at {datatype}")
+    history_index.create(connection, checkfirst=True)
 
 
 class IdempotencyConflict(ValueError):
@@ -88,10 +120,15 @@ class A2ARequestStore:
         async with self._initialize_lock:
             if not self._initialized:
                 async with self.repo.engine.begin() as connection:
-                    await connection.run_sync(lambda conn: requests.create(conn, checkfirst=True))
-                    await connection.run_sync(
-                        lambda conn: delegations.create(conn, checkfirst=True)
-                    )
+                    # Serialize additive schema inspection/change across Store
+                    # objects and connections. Neither path reconstructs rows.
+                    if connection.dialect.name == "sqlite":
+                        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    elif connection.dialect.name == "postgresql":
+                        await connection.execute(
+                            text("SELECT pg_advisory_xact_lock(1936028772, 2)")
+                        )
+                    await connection.run_sync(_initialize_tables)
                 self._initialized = True
 
     async def create_or_get(
@@ -254,6 +291,7 @@ class A2ARequestStore:
                     },
                     task=None,
                     status="PENDING",
+                    created_at=utcnow(),
                 )
                 await session.execute(insert(delegations).values(**values))
                 return values
@@ -296,7 +334,9 @@ class A2ARequestStore:
                     await session.execute(
                         select(delegations)
                         .where(delegations.c.project_id == project_id)
-                        .order_by(delegations.c.id)
+                        .order_by(
+                            delegations.c.created_at.desc().nulls_last(), delegations.c.id.desc()
+                        )
                         .limit(max(1, min(limit, 200)))
                         .offset(max(0, offset))
                     )
@@ -305,6 +345,27 @@ class A2ARequestStore:
                 .all()
             )
             return [dict(row) for row in rows]
+
+    async def page_delegations(self, project_id, *, limit=20, cursor=None) -> dict:
+        if await self.repo.get_project(project_id) is None:
+            raise KeyError(project_id)
+        position = decode_cursor(cursor, project_id=project_id, resource="a2a")
+        if not 1 <= limit <= 100:
+            raise ValueError("History page size must be between 1 and 100")
+        await self.initialize()
+        query = select(delegations).where(delegations.c.project_id == project_id)
+        if position is not None:
+            query = query.where(
+                before_position(delegations.c.created_at, delegations.c.id, position)
+            )
+        query = query.order_by(
+            delegations.c.created_at.desc().nulls_last(), delegations.c.id.desc()
+        ).limit(limit + 1)
+        async with self.repo.sessions() as session:
+            rows = (await session.execute(query)).mappings().all()
+        return history_page(
+            [dict(row) for row in rows], limit=limit, project_id=project_id, resource="a2a"
+        )
 
     async def record_task(self, delegation_id, task: dict) -> dict:
         existing = await self.get_delegation(delegation_id)

@@ -284,3 +284,122 @@ async def test_postgres_a2a_binding_and_real_sandbox_audit(postgres_schema):
         ]
     finally:
         await recovered.shutdown()
+
+
+async def test_postgres_legacy_history_upgrade_keysets_and_cached_remote_records(postgres_schema):
+    from signaldesk.a2a_client import A2ADelegate
+    from signaldesk.a2a_store import A2ARequestStore, delegations
+    from signaldesk.sandbox import SandboxExecution, SandboxService
+
+    repo, settings, _, _ = postgres_schema
+    own = await project(repo, "History migration")
+    await A2ARequestStore(repo).initialize()
+    old_id = str(uuid4())
+    async with repo.engine.begin() as connection:
+        # Reconstruct the previous release's schema before initializing a Store.
+        await connection.execute(text("DROP INDEX IF EXISTS ix_a2a_delegations_history"))
+        await connection.execute(text("ALTER TABLE a2a_delegations DROP COLUMN created_at"))
+        await connection.execute(
+            text(
+                "INSERT INTO a2a_delegations (id,message_id,payload_hash,project_id,remote,endpoint,remote_project_id,status) "
+                "VALUES (:id,'pg-legacy','legacy',:project,'offline','https://offline.fixture/a2a/','target','PENDING')"
+            ),
+            {"id": old_id, "project": own.id},
+        )
+    first, second = A2ARequestStore(repo), A2ARequestStore(repo)
+    await asyncio.gather(first.initialize(), second.initialize())
+    assert (await first.get_delegation(old_id))["created_at"] is None
+    ids = []
+    at = datetime(2026, 10, 23, tzinfo=UTC)
+    for index in range(4):
+        row = await first.prepare_delegation(
+            project_id=own.id,
+            run_id=None,
+            remote="offline",
+            endpoint="https://offline.fixture/a2a/",
+            remote_project_id="target",
+            message_id=f"pg-history-{index}",
+            mode="demo",
+            demo_revision=1,
+        )
+        ids.append(row["id"])
+        async with repo.sessions.begin() as session:
+            await session.execute(
+                delegations.update().where(delegations.c.id == row["id"]).values(created_at=at)
+            )
+    expected = sorted(ids, reverse=True) + [old_id]
+    collected = []
+    cursor = None
+    while True:
+        page = await first.page_delegations(own.id, limit=2, cursor=cursor)
+        collected.extend(x["id"] for x in page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert collected == expected
+    cached = await A2ADelegate(settings, repo).local_record(own.id, old_id)
+    assert cached["task"] is None and cached["created_at"] is None and "endpoint" not in cached
+    service = SandboxService(repo, settings)
+    await service.initialize()
+    try:
+        async with repo.sessions.begin() as session:
+            for identifier in ids:
+                session.add(
+                    SandboxExecution(
+                        id=identifier,
+                        project_id=own.id,
+                        run_id=None,
+                        status="completed",
+                        image="fixture",
+                        code_hash="0" * 64,
+                        result=None,
+                        created_at=at,
+                        updated_at=at,
+                    )
+                )
+        page = await service.page(own.id, limit=2)
+        tail = await service.page(own.id, limit=2, cursor=page["next_cursor"])
+        assert [x["id"] for x in page["items"] + tail["items"]] == sorted(ids, reverse=True)
+        assert tail["next_cursor"] is None
+    finally:
+        await service.shutdown()
+
+
+async def test_postgres_memory_bulk_equal_times_repairs_retention_without_touching_preferences(
+    postgres_schema,
+):
+    from langgraph.store.base import PutOp
+
+    from signaldesk.memory import ProjectMemory, open_memory_store
+
+    repo, settings, schema, _ = postgres_schema
+    own = await project(repo, "Store retention")
+    url = (
+        make_url(settings.database_url)
+        .set(drivername="postgresql")
+        .update_query_dict({"options": f"-csearch_path={schema},public"})
+        .render_as_string(hide_password=False)
+    )
+    settings = settings.model_copy(update={"memory_url": url})
+    namespace = ("projects", own.id, "runs")
+    async with open_memory_store(settings) as store:
+        memory = ProjectMemory(store, max_items=1)
+        await memory.set_preference(own.id, "language", {"value": "中文"})
+        await store.abatch(
+            [
+                PutOp(
+                    namespace,
+                    f"seed-{i}",
+                    {"kind": "run_summary", "source": "verified_run", "content": {"value": i}},
+                )
+                for i in range(150)
+            ]
+        )
+        seeded = await store.asearch(namespace, limit=200)
+        assert len(seeded) == 150 and len({item.updated_at for item in seeded}) == 1
+        await memory.remember_run(own.id, "seed-0", {"value": "must not overwrite existing"})
+        remaining = await store.asearch(namespace, limit=200)
+        assert len(remaining) == 1
+        await memory.remember_run(own.id, "latest", {"value": 200})
+        assert [item.key for item in await store.asearch(namespace, limit=200)] == ["latest"]
+        assert (await memory.get_preference(own.id, "language"))["value"] == {"value": "中文"}

@@ -8,10 +8,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from signaldesk.config import Settings
+from signaldesk.history import HistoryCursorError, HistoryPage
 from signaldesk.repository import Repository
 from signaldesk.sandbox import (
     SandboxBusyError,
     SandboxConflictError,
+    SandboxExecutionRead,
     SandboxService,
     SandboxUnavailableError,
     SandboxValidationError,
@@ -86,6 +88,21 @@ def create_sandbox_router(
         limit: int = Query(default=20, ge=1, le=100),
     ):
         return await (await resolve(project_id, request)).list(project_id, limit)
+
+    @router.get(
+        "/{project_id}/sandbox/executions/page", response_model=HistoryPage[SandboxExecutionRead]
+    )
+    async def page_executions(
+        project_id: str,
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=512),
+    ):
+        current = await resolve(project_id, request)
+        try:
+            return await current.page(project_id, limit=limit, cursor=cursor)
+        except HistoryCursorError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @router.get("/{project_id}/sandbox/executions/{execution_id}")
     async def get_execution(project_id: str, execution_id: str, request: Request):

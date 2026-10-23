@@ -7,7 +7,7 @@
 
 Evidence-first competitive intelligence agents with durable workflows, project memory, hybrid retrieval, Docker Sandbox and A2A interoperability.
 
-当前版本 **0.4.1**：完善 A2A 重试与终态一致性、任务取消/恢复和关闭收尾、Sandbox 结果与审计边界，增加全局请求体限额及 PostgreSQL/Docker 集成 CI。详见 [本轮可靠性说明](docs/V0.4.1_UPGRADE.md)。
+当前版本 **0.4.2**：扩展历史支持游标分页、加载更多与页外选中恢复；已完成的 A2A 委托可从本地缓存离线查看，同时完善旧库兼容升级、Sandbox 启动收尾和项目记忆边界。详见 [本轮说明](docs/V0.4.2_UPGRADE.md)。
 
 ## 本地启动
 
@@ -39,7 +39,7 @@ Northstar / Orbit 是虚构夹具，demo 不访问外网、不调用模型。
 - Sandbox：容器内执行 Python/JSON，离线、非 root、只读根目录、资源/输出限制、超时/取消清理、持久执行审计。
 - A2A：官方 SDK 1.2.2、协议 1.0 JSON-RPC 及 SDK 0.3 兼容，Agent Card、任务委托/查询/取消、持久幂等和远端白名单。
 - Deep Agents 可按需调用 `execute_python` 与已授权映射的 `delegate_research`；每次绑定当前项目/run，入站 A2A 研究禁止继续自动委托。
-- 前端「扩展能力」提供实际执行与委托表单，展示真实 stdout/stderr/JSON、任务状态与远端报告。
+- 前端「扩展能力」提供实际执行与委托表单，展示真实 stdout/stderr/JSON、任务状态与远端报告；历史首屏 20 条，支持加载更多、恢复页外选择和本地缓存详情。
 - `GET /api/capabilities` 查看本实例的检索、记忆、交互与扩展状态。
 - `/api` 与 `/a2a` 下的 `POST`、`PUT`、`PATCH` 在解析前限制请求体实际字节数；`MAX_REQUEST_BYTES` 默认 `1048576`（1 MiB），超限返回 413，非 `identity` 内容编码返回 415。
 
@@ -54,6 +54,7 @@ AG-UI 当前是业务任务的标准事件投影，未实现通用 `RunAgentInpu
 - [架构、API 与项目目录](docs/ARCHITECTURE.md)
 - [分阶段实施与当前状态](docs/ROADMAP.md)
 - [启动、配置和评测](docs/OPERATIONS.md)
+- [V0.4.2 历史分页与生命周期](docs/V0.4.2_UPGRADE.md)
 - [V0.4.1 可靠性与运行边界](docs/V0.4.1_UPGRADE.md)
 - [V0.4 Sandbox 与 A2A](docs/V0.4_UPGRADE.md)
 - [Sandbox 配置与隔离边界](docs/SANDBOX.md)
@@ -69,7 +70,7 @@ uv run signaldesk-mcp
 docker compose up --build
 ```
 
-验证状态见 [本轮说明](docs/V0.4.1_UPGRADE.md)。本轮本地完整回归 **234 项通过**，包括真实 PostgreSQL 和 Docker 集成；离线夹具仍为 **9/9 场景、55/55 项期望匹配**，它不衡量真实模型效果。
+验证范围见 [本轮说明](docs/V0.4.2_UPGRADE.md)。完整 Python 回归 **265 项通过**（含真实 PostgreSQL/Docker），前端行为测试 **4/4 通过**。隔离 HTTP 服务已验证两类历史跨页、刷新恢复和远端不可用时的本地详情；离线评测为 **9/9 场景、55/55 项期望匹配**，不衡量真实模型效果。
 GitHub Actions 已新增 PostgreSQL 与 Docker 真实集成任务；fork PR 保留离线检查。各次提交的实际结果见 [Actions](https://github.com/01jiyuge/signaldesk/actions/workflows/ci.yml)。
 没有使用真实模型、嵌入或远端 Reranker 密钥，也未上传 LangSmith；这些服务的效果仍需配置后验收。
 Docker 隔离与双实例 A2A 已实际运行。Compose 默认不开放 Docker socket，容器内 app 不自动获得宿主执行器权限；Sandbox 可先按原生 Python + Docker 路径运行。

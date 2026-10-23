@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
+import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from sqlalchemy import inspect
@@ -309,7 +310,7 @@ async def test_shutdown_owns_start_that_is_still_committing_its_queue_row(api, m
     async def gated_begin():
         async with original_begin() as session:
             yield session
-            if asyncio.current_task().get_name() == "start-during-shutdown":
+            if asyncio.current_task().get_name().startswith("sandbox-start:"):
                 committing.set()
                 await release.wait()
 
@@ -326,3 +327,159 @@ async def test_shutdown_owns_start_that_is_still_committing_its_queue_row(api, m
     await asyncio.wait_for(closing, 1)
     assert not service._tasks and cli.active == 0
     assert (await service.get(project.id, row.id)).status == "cancelled"
+
+
+def gate_committed_start(repo, monkeypatch):
+    committed, release = asyncio.Event(), asyncio.Event()
+    original_begin = repo.sessions.begin
+
+    @asynccontextmanager
+    async def after_commit():
+        async with original_begin() as session:
+            yield session
+        # This boundary is after the real transaction committed, not before it.
+        # The caller must not be able to cancel away producer registration.
+        if (
+            asyncio.current_task().get_name().startswith("sandbox-start:")
+            and not committed.is_set()
+        ):
+            committed.set()
+            await release.wait()
+
+    monkeypatch.setattr(repo.sessions, "begin", after_commit)
+    return committed, release
+
+
+@pytest.mark.parametrize("entry", ["http", "tool"])
+async def test_cancelled_start_caller_cannot_orphan_committed_execution(api, monkeypatch, entry):
+    client, repo, service, cli, project, _, _ = api
+    run = await repo.create_run(project.id, RunCreate())
+    cli.hold = True
+    committed, release = gate_committed_start(repo, monkeypatch)
+    action = (
+        client.post(
+            f"/api/projects/{project.id}/sandbox/executions",
+            headers=AUTH,
+            json={"code": "result=42", "run_id": run.id},
+        )
+        if entry == "http"
+        else service.execute(project.id, "result=42", run_id=run.id)
+    )
+    request = asyncio.create_task(action)
+    try:
+        await asyncio.wait_for(committed.wait(), 1)
+        assert len(await service.list(project.id)) == 1
+        assert not service._tasks and service._start_operations
+        request.cancel()
+        await asyncio.sleep(0)
+        request.cancel()
+        assert not request.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, 1)
+        rows = await service.list(project.id)
+        assert len(rows) == 1 and not service._start_operations
+        if entry == "http":
+            await asyncio.wait_for(cli.started.wait(), 1)
+            assert rows[0].id in service._tasks
+            assert (await service.get(project.id, rows[0].id)).status == "running"
+            await service.cancel(project.id, rows[0].id)
+        final = await service.get(project.id, rows[0].id)
+        assert final.status == "cancelled" and final.result.cleanup_confirmed
+        assert not service._tasks and cli.active == 0
+        assert sum(args[0] == "start" for args, _ in cli.calls) <= 1
+        events = [
+            event
+            for event in await repo.list_events(run.id)
+            if event.data.get("execution_id") == final.id
+        ]
+        assert sum(event.kind == "sandbox_cancelled" for event in events) == 1
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+async def test_shutdown_drains_disconnected_committed_start_before_snapshot(api, monkeypatch):
+    client, repo, service, cli, project, _, _ = api
+    cli.hold = True
+    run = await repo.create_run(project.id, RunCreate())
+    committed, release = gate_committed_start(repo, monkeypatch)
+    closing_entered = asyncio.Event()
+    request = asyncio.create_task(
+        client.post(
+            f"/api/projects/{project.id}/sandbox/executions",
+            headers=AUTH,
+            json={"code": "result=42", "run_id": run.id},
+        )
+    )
+    closing = None
+    try:
+        await asyncio.wait_for(committed.wait(), 1)
+        request.cancel()
+
+        async def close_service():
+            closing_entered.set()
+            await service.shutdown()
+
+        closing = asyncio.create_task(close_service())
+        await asyncio.wait_for(closing_entered.wait(), 1)
+        assert service._closing and not closing.done() and service._start_operations
+        denied = await client.post(
+            f"/api/projects/{project.id}/sandbox/executions",
+            headers=AUTH,
+            json={"code": "result=99"},
+        )
+        assert denied.status_code == 503 and len(await service.list(project.id)) == 1
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, 1)
+        await asyncio.wait_for(closing, 1)
+        final = (await service.list(project.id))[0]
+        assert final.status == "cancelled" and final.result.cleanup_confirmed
+        assert not service._start_operations and not service._tasks and cli.active == 0
+        assert [event.kind for event in await repo.list_events(run.id)].count(
+            "sandbox_cancelled"
+        ) == 1
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(task for task in (request, closing) if task is not None), return_exceptions=True
+        )
+
+
+async def test_concurrent_starts_obey_capacity_and_concurrent_cancel_frees_one_slot(api):
+    client, repo, service, cli, project, _, settings = api
+    cli.hold = True
+    run = await repo.create_run(project.id, RunCreate())
+    endpoint = f"/api/projects/{project.id}/sandbox/executions"
+    capacity = max(8, settings.sandbox_max_concurrent * 8)
+    results = await asyncio.gather(
+        *[
+            client.post(endpoint, headers=AUTH, json={"code": f"result={index}", "run_id": run.id})
+            for index in range(capacity + 1)
+        ]
+    )
+    assert sum(response.status_code == 202 for response in results) == capacity
+    rejected = [response for response in results if response.status_code != 202]
+    assert len(rejected) == 1 and rejected[0].status_code == 429
+    assert rejected[0].headers["retry-after"] == "5"
+    await asyncio.wait_for(cli.started.wait(), 1)
+    assert len(service._tasks) == capacity and not service._start_operations
+    assert cli.active == cli.peak == settings.sandbox_max_concurrent
+    queued = next(row for row in await service.list(project.id, 100) if row.status == "queued")
+    cancellations = await asyncio.gather(
+        *[client.post(endpoint + f"/{queued.id}/cancel", headers=AUTH) for _ in range(2)]
+    )
+    assert any(response.status_code == 200 for response in cancellations)
+    assert all(response.status_code in (200, 409) for response in cancellations)
+    events = [
+        event
+        for event in await repo.list_events(run.id)
+        if event.data.get("execution_id") == queued.id
+    ]
+    assert sum(event.kind == "sandbox_cancelled" for event in events) == 1
+    assert len(service._tasks) == capacity - 1
+    replacement = await client.post(endpoint, headers=AUTH, json={"code": "result=99"})
+    assert replacement.status_code == 202 and len(service._tasks) == capacity
+    assert len(await service.list(project.id, 100)) == capacity + 1
+    assert cli.peak == settings.sandbox_max_concurrent

@@ -33,6 +33,26 @@ from sqlalchemy.engine import make_url
 from signaldesk.config import Settings
 
 
+async def _finish_owned(operation):
+    """Keep resource/mutation ownership until cooperative work really stops."""
+    task = asyncio.ensure_future(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        # Retrieve a failed result without allowing a cleanup error to replace
+        # the caller's cancellation or become an unhandled task exception.
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
+
+
 def _namespace(namespace: tuple[str, ...], *, write: bool = False) -> None:
     if not isinstance(namespace, tuple):
         raise InvalidNamespaceError("Namespace must be a tuple of string labels")
@@ -115,16 +135,21 @@ class SQLiteStore(BaseStore):
         self._lock = threading.RLock()
         self._closed = False
         self._connection = sqlite3.connect(path, check_same_thread=False, timeout=10)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA busy_timeout=10000")
-        self._connection.execute(
-            "CREATE TABLE IF NOT EXISTS store_items ("
-            "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
-            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
-            "PRIMARY KEY(namespace, key))"
-        )
-        self._connection.commit()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA busy_timeout=10000")
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS store_items ("
+                "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "PRIMARY KEY(namespace, key))"
+            )
+            self._connection.commit()
+        except BaseException:
+            self._connection.close()
+            self._closed = True
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -201,6 +226,8 @@ class SQLiteStore(BaseStore):
             if op.limit < 0 or op.offset < 0:
                 raise ValueError("Search limit and offset must be nonnegative")
             _validate_filter(op.filter)
+            if op.limit == 0:
+                return []
             query = "SELECT * FROM store_items"
             params = []
             if op.namespace_prefix:
@@ -208,20 +235,31 @@ class SQLiteStore(BaseStore):
                 prefix = exact[:-1] + ","
                 query += " WHERE namespace=? OR substr(namespace,1,?)=?"
                 params = [exact, len(prefix), prefix]
-            rows = self._connection.execute(
+            cursor = self._connection.execute(
                 query + " ORDER BY updated_at DESC, namespace ASC, key ASC", params
-            ).fetchall()
-            matched = [
-                row
-                for row in rows
-                if all(
-                    _matches(json.loads(row["value"]).get(key), value)
-                    for key, value in (op.filter or {}).items()
-                )
-            ]
-            return [
-                self._item(row, search=True) for row in matched[op.offset : op.offset + op.limit]
-            ]
+            )
+            matched, skipped = [], 0
+            try:
+                # Filters include Python-only nested comparisons. Stream bounded
+                # batches instead of materializing every namespace record before
+                # applying offset/limit, including during overflow repair.
+                while rows := cursor.fetchmany(64):
+                    for row in rows:
+                        value = json.loads(row["value"])
+                        if not all(
+                            _matches(value.get(key), expected)
+                            for key, expected in (op.filter or {}).items()
+                        ):
+                            continue
+                        if skipped < op.offset:
+                            skipped += 1
+                            continue
+                        matched.append(self._item(row, search=True))
+                        if len(matched) == op.limit:
+                            return matched
+                return matched
+            finally:
+                cursor.close()
         if isinstance(op, ListNamespacesOp):
             if op.limit < 0 or op.offset < 0 or (op.max_depth is not None and op.max_depth < 1):
                 raise ValueError("Invalid namespace pagination or max_depth")
@@ -266,11 +304,25 @@ async def open_memory_store(settings: Settings):
     elif url.get_backend_name() == "sqlite" and url.database:
         if url.query:
             raise ValueError("SQLite memory URL query parameters are unsupported")
-        store = await asyncio.to_thread(SQLiteStore, url.database)
+        opening = asyncio.create_task(asyncio.to_thread(SQLiteStore, url.database))
+        try:
+            store = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            # __aenter__ has not yielded yet, so an outer ExitStack cannot own
+            # this connection. The constructor thread cannot be cancelled.
+            async def close_opening():
+                try:
+                    constructed = await opening
+                except Exception:
+                    return
+                await asyncio.to_thread(constructed.close)
+
+            await _finish_owned(close_opening())
+            raise
         try:
             yield store
         finally:
-            await asyncio.to_thread(store.close)
+            await _finish_owned(asyncio.to_thread(store.close))
     else:
         raise ValueError("MEMORY_URL must use sqlite:/// or postgresql://")
 
@@ -315,6 +367,10 @@ class ProjectMemory:
             raise MemoryValidationError(
                 "记忆 key 须为 1–80 字符，且不可包含控制字符、路径分隔符或首尾空格。"
             )
+        try:
+            key.encode("utf-8")
+        except UnicodeError as exc:
+            raise MemoryValidationError("记忆 key 必须是有效 UTF-8 文本。") from exc
         return key
 
     @staticmethod
@@ -323,11 +379,13 @@ class ProjectMemory:
             raise MemoryValidationError("记忆内容必须是 JSON 对象。")
         try:
             encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError) as exc:
+            size = len(encoded.encode("utf-8"))
+            decoded = json.loads(encoded)
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
             raise MemoryValidationError("记忆内容必须可序列化为标准 JSON。") from exc
-        if len(encoded.encode("utf-8")) > 8000:
+        if size > 8000:
             raise MemoryValidationError("单条记忆内容不可超过 8000 字节。")
-        return json.loads(encoded)
+        return decoded
 
     @staticmethod
     def _record(item: Item) -> dict:
@@ -387,19 +445,74 @@ class ProjectMemory:
         namespace = self._namespace(project_id, "runs")
         key, summary = self._key(run_id), self._value(summary)
         async with self._locks.setdefault(project_id, asyncio.Lock()):
-            existing = await self.store.aget(namespace, key)
-            if existing is not None:
+
+            async def remember_and_prune():
+                existing = await self.store.aget(namespace, key)
+                if existing is None:
+                    await self.store.aput(
+                        namespace,
+                        key,
+                        {"kind": "run_summary", "source": "verified_run", "content": summary},
+                    )
+                    existing = await self.store.aget(namespace, key)
+                # Idempotent retries also repair an older overflow or a reduced
+                # configuration; a successful insert alone is not completion.
+                await self._prune_runs(namespace)
                 return self._record(existing)
-            await self.store.aput(
+
+            return await _finish_owned(remember_and_prune())
+
+    async def _prune_runs(self, namespace: tuple[str, ...]) -> None:
+        window, offset, retained = self.max_items + 64, 0, {}
+        foreign_pages, previous_page, previous_expired = 0, None, None
+        while True:
+            page = await self.store.asearch(
                 namespace,
-                key,
-                {"kind": "run_summary", "source": "verified_run", "content": summary},
+                filter={"kind": "run_summary", "source": "verified_run"},
+                limit=window,
+                offset=offset,
             )
-            items = await self.store.asearch(namespace, limit=self.max_items + 1)
-            items = sorted(items, key=lambda item: item.updated_at, reverse=True)
-            for item in items[self.max_items :]:
-                await self.store.adelete(namespace, item.key)
-            return self._record(await self.store.aget(namespace, key))
+            if not page:
+                return
+            # Store search is a namespace-prefix operation. Only records in
+            # this exact run namespace are ours to evict, never preferences or
+            # a descendant namespace populated by another Store consumer.
+            candidates = dict(retained)
+            candidates.update(
+                {(item.namespace, item.key): item for item in page if item.namespace == namespace}
+            )
+            ranked = sorted(
+                candidates.values(), key=lambda item: (item.updated_at, item.key), reverse=True
+            )
+            retained = {(item.namespace, item.key): item for item in ranked[: self.max_items]}
+            expired = ranked[self.max_items :]
+            if expired:
+                fingerprint = frozenset(
+                    (item.namespace, item.key, item.updated_at) for item in expired
+                )
+                if fingerprint == previous_expired:
+                    raise MemoryLimitError("运行摘要清理未取得进展，请检查 Store 状态后重试。")
+                await self.store.abatch([PutOp(namespace, item.key, None) for item in expired])
+                # The official PostgreSQL Store does not order timestamp ties by
+                # key. Restart after every deletion instead of assuming OFFSET
+                # preserves the order of tied rows. At most max_items are kept,
+                # so an exact-namespace window larger than that must progress.
+                offset, foreign_pages, previous_page = 0, 0, None
+                previous_expired = fingerprint
+                continue
+            if len(page) < window:
+                return
+            # Prefix searches can be dominated by another consumer's descendant
+            # namespaces. Read through a finite number of foreign-only windows,
+            # never evicting those records or spinning on a non-progressing store.
+            identity = frozenset((item.namespace, item.key) for item in page)
+            foreign_pages += 1
+            if identity == previous_page or foreign_pages >= 8:
+                raise MemoryLimitError(
+                    "运行摘要命名空间包含过多外来记录，无法安全清理；请检查 Store 命名空间。"
+                )
+            previous_page = identity
+            offset += len(page)
 
     async def load_context(self, project_id: str, limit: int = 10) -> dict:
         if not 1 <= limit <= 1000:

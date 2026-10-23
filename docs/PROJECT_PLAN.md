@@ -1,6 +1,6 @@
 # SignalDesk · 竞品情报 Agent 项目方案
 
-更新日期：2026-10-22。当前实现为 V0.4.1，本地单用户、单进程验证版本。本文保留产品目标和首期设计，新增能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md) 与 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)。
+更新日期：2026-10-23。当前实现为 V0.4.2，本地单用户、单进程验证版本。本文保留产品目标和首期设计，新增能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)、[V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md) 与 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)。
 
 > 本文中的“V0.1 目标”是验收要求，不代表所有目标已经验证。实现与验证状态见 [ROADMAP.md](./ROADMAP.md) 的状态表；接口和目录以 [ARCHITECTURE.md](./ARCHITECTURE.md) 及运行中的 OpenAPI 为准。演示数据必须标为夹具，不能作为真实市场情报。当前 verify 节点检查引用是否指向存在的证据、引文是否存在于原文；这不等于证明事实真实或推理成立。
 

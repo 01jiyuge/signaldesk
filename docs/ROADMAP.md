@@ -1,6 +1,6 @@
 # 分阶段实施与验收状态
 
-更新日期：2026-10-22；当前 V0.4.1，可靠性增量见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)。本表区分“代码可运行”和“真实服务已验收”。
+更新日期：2026-10-23；当前 V0.4.2，历史与生命周期增量见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)。本表区分“代码可运行”和“真实服务已验收”。
 
 ## 1. 当前完成情况
 
@@ -18,11 +18,11 @@
 
 ## 2. 本轮验证记录
 
-- Python 3.14.6；完整回归 **234 passed**，包含真实 PostgreSQL 的 4 项和真实 Docker 的 3 项集成测试（其中一项PG结合Docker）。
+- Python 3.14.6；完整回归 **265 passed**，包含真实 PostgreSQL 的 6 项和真实 Docker 的 3 项集成测试（其中一项PG结合Docker）；另有4项前端行为测试。
 - 实际 PostgreSQL 18.4 + pgvector 0.8.7：全文与 GIN、项目/最新成功快照隔离、真实向量距离、相同正文向量复用、Store 关闭重开、检查点恢复、FastAPI 整体生命周期通过。测试在独立本地库/随机 schema 中执行。
 - `signaldesk-eval`：9/9 固定夹具场景、55/55 项期望匹配。衡量 demo、变化判断和引用拒绝，不代表真实模型质量或人工事实支持率。
 - Chrome 实测：AG-UI 返回 `text/event-stream`，断线后从已接收事件游标续传；切项目取消旧订阅且不取消后台运行；偏好新增/编辑/删除；服务重启后偏好与运行摘要保留；不同项目记忆不串入。
-- Ruff lint/format、JavaScript 语法、锁文件、Compose 配置通过。CI 配置包含离线评测，尚未在远端执行。
+- Ruff lint/format、JavaScript 语法、锁文件通过。CI 包含离线评测、前端行为与真实 PostgreSQL/Docker 集成任务；每次提交的远端状态见 GitHub Actions。
 - 没有运行真实模型、嵌入服务、远端 Reranker、外部 MCP 或 LangSmith 云端上传；Docker daemon与官方Python镜像已实际使用，应用容器镜像已构建并运行离线评测。
 - Sandbox 实测执行/失败/超时/取消、权限/资源和清理；A2A 实测独立HTTP实例与报告、持久幂等、历史、取消冲突和响应限制。可按 [A2A.md](./A2A.md) 使用不同端口、独立数据库复现双实例委托。
 - 公网采集冒烟曾遇到代理 fake-IP DNS 限制：示例公网域名解析到保留地址，按规则被拒绝。未放宽来源地址限制；真实公网采集仍需在合适的网络环境中验收。

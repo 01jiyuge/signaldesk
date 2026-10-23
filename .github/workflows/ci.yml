@@ -21,6 +21,7 @@ jobs:
       - run: uv run pytest -q
       - run: uv run signaldesk-eval
       - run: node --check src/signaldesk/static/app.js
+      - run: node --test tests/frontend_history.mjs
 
   integration:
     name: PostgreSQL and Docker integration
