@@ -9,14 +9,16 @@ from test_sandbox import FakeCLI
 
 import signaldesk.app as application
 from signaldesk.config import Settings
+from signaldesk.local_storage import StorageError, storage_locks
 from signaldesk.memory import ProjectMemory, open_memory_store
 from signaldesk.repository import Repository
 from signaldesk.sandbox import DockerSandbox
 from signaldesk.schemas import ProjectCreate, RunCreate
 
 
-def composed_fakes(monkeypatch, *, fail=None, close_failures=()):
+def composed_fakes(monkeypatch, tmp_path, *, fail=None, close_failures=()):
     calls, active = [], set()
+    paths = {"business": tmp_path / "business.db"}
 
     async def initialize(name):
         calls.append(name + ".initialize")
@@ -25,6 +27,11 @@ def composed_fakes(monkeypatch, *, fail=None, close_failures=()):
             raise RuntimeError("controlled partial initialize failure")
 
     async def close(name, operation="close"):
+        # Even the final repo closer and a failing closer still own the file.
+        with pytest.raises(StorageError) as conflict:
+            with storage_locks(paths):
+                pytest.fail("Database ownership was released before resources closed")
+        assert conflict.value.code == "storage_busy"
         calls.append(name + "." + operation)
         active.discard(name)
         if name + "." + operation in close_failures:
@@ -69,8 +76,29 @@ def composed_fakes(monkeypatch, *, fail=None, close_failures=()):
     monkeypatch.setattr(application, "Workflow", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(application, "open_checkpointer", lambda _: resource("checkpointer"))
     monkeypatch.setattr(application, "open_memory_store", lambda _: resource("store"))
-    app = application.create_app(Settings(_env_file=None, enable_a2a=False))
+    app = application.create_app(
+        Settings(
+            _env_file=None,
+            enable_a2a=False,
+            database_url=f"sqlite+aiosqlite:///{tmp_path}/business.db",
+            checkpoint_url=f"sqlite:///{tmp_path}/checkpoints.db",
+            memory_url=f"sqlite:///{tmp_path}/memory.db",
+        )
+    )
     return app, calls, active
+
+
+async def test_conflicting_owner_prevents_all_application_initialization(monkeypatch, tmp_path):
+    app, calls, active = composed_fakes(monkeypatch, tmp_path)
+    with storage_locks({"memory": tmp_path / "memory.db"}):
+        with pytest.raises(StorageError) as conflict:
+            async with app.router.lifespan_context(app):
+                pytest.fail("A conflicting process must prevent application startup")
+        assert conflict.value.code == "storage_busy"
+        assert not calls and not active
+        # Failure on the later memory lock cannot retain earlier acquisitions.
+        with storage_locks({"business": tmp_path / "business.db"}):
+            pass
 
 
 @pytest.mark.parametrize(
@@ -84,8 +112,10 @@ def composed_fakes(monkeypatch, *, fail=None, close_failures=()):
         "jobs.recover",
     ],
 )
-async def test_partial_startup_failure_closes_pre_registered_resources(monkeypatch, failure):
-    app, calls, active = composed_fakes(monkeypatch, fail=failure)
+async def test_partial_startup_failure_closes_pre_registered_resources(
+    monkeypatch, tmp_path, failure
+):
+    app, calls, active = composed_fakes(monkeypatch, tmp_path, fail=failure)
     with pytest.raises(RuntimeError, match="controlled"):
         async with app.router.lifespan_context(app):
             raise AssertionError("A failed startup must not yield a running app")
@@ -97,6 +127,8 @@ async def test_partial_startup_failure_closes_pre_registered_resources(monkeypat
         == 1
     )
     assert not active
+    with storage_locks({"business": tmp_path / "business.db"}):
+        pass
     if failure == "store.open":
         assert "checkpointer.close" in calls
     if failure == "jobs.recover":
@@ -118,8 +150,8 @@ async def test_partial_startup_failure_closes_pre_registered_resources(monkeypat
         ("jobs.shutdown",),
     ],
 )
-async def test_one_closer_failure_does_not_skip_other_owners(monkeypatch, failures):
-    app, calls, active = composed_fakes(monkeypatch, close_failures=failures)
+async def test_one_closer_failure_does_not_skip_other_owners(monkeypatch, tmp_path, failures):
+    app, calls, active = composed_fakes(monkeypatch, tmp_path, close_failures=failures)
     with pytest.raises(RuntimeError, match="controlled closer failure"):
         async with app.router.lifespan_context(app):
             assert active == {"repo", "retriever", "sandbox", "checkpointer", "store", "jobs"}
@@ -134,6 +166,8 @@ async def test_one_closer_failure_does_not_skip_other_owners(monkeypatch, failur
     assert calls[-6:] == expected
     assert all(calls.count(name) == 1 for name in expected)
     assert not active
+    with storage_locks({"business": tmp_path / "business.db"}):
+        pass
 
 
 async def test_real_persistence_stays_open_until_its_producers_are_joined(tmp_path, monkeypatch):

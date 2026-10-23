@@ -1,6 +1,6 @@
 # 启动、配置与验证
 
-更新：2026-10-23。当前 V0.4.6 为本地单用户、单进程可运行版本；扩展历史和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，本轮分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)。
+更新：2026-10-23。当前 V0.4.7 为本地单用户、单进程可运行版本；扩展历史和旧库兼容升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，MAX_REQUEST_BYTES 配置见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)，本轮离线备份与恢复见 [V0.4.7_UPGRADE.md](./V0.4.7_UPGRADE.md)。
 
 ## 1. 本地启动
 
@@ -29,7 +29,7 @@ V0.2 可在项目标题旁编辑来源与关注规则，活动任务结束后才
 已完成报告可点击 Markdown / JSON 导出；新旧快照和引用随报告一起保留。
 
 研究历史首屏加载 20 条轻量摘要，使用“加载更多”继续读取。完整报告在选择运行后按需获取；页外选中项和活动项单独保留，不改变已加载条数或下一页游标。新客户端应使用 `GET /api/projects/{id}/runs/page`，旧 `GET /api/runs` 仍全量返回含报告的记录，仅作兼容。
-本轮升级不增加数据列或依赖，但首次启动会为旧库补建 `(run_id, id)` 事件索引；按既有流程备份业务库、checkpointer 和 Store 后更新并重启即可。
+本轮不增加数据列或依赖。升级旧版时先停服，再使用新维护命令备份三库，最后启动新服务。旧版本不持有新协作锁，不能仅凭未出现锁冲突就认定旧服务已经停止。
 
 以上产品、日期与价格全部为虚构测试夹具；不访问示例域名，不调用模型 API。
 演示与真实模式都写入 mode 字段。用户应为真实来源另建项目，避免示例与业务材料混用。
@@ -136,7 +136,22 @@ RERANKER_TIMEOUT_SECONDS=20
 collect 开始时冻结记忆，运行期间修改的偏好用于下一次运行，恢复沿用原上下文。
 默认每类保留 50 项（`MEMORY_MAX_ITEMS`），单个偏好值不超过 8KB；摘要不是事实认证。
 偏好与运行摘要按精确项目命名空间及类别分别计数；后代命名空间或被其他类别占用的 Store key 不会被覆盖或清理。有界扫描无法证明已完整读取时拒绝操作，项目记忆列表也返回 409；先检查 Store 中的外来记录或历史溢出，再重试，不把不完整扫描当作空记忆。
-升级备份需同时保留业务库、checkpointer 与 Store；SQLite 三个文件应在服务停止后一起备份。
+升级备份需同时保留业务库、checkpointer 与 Store；SQLite 三个文件应在服务停止后一起备份，推荐使用本轮 `signaldesk-db` 命令，不要只复制可能仍依赖 WAL 的主文件。
+
+### SQLite 三库离线维护
+
+停止服务及所有外部 SQLite 写入者后，在项目目录执行：
+
+```bash
+mkdir -p data/backups
+uv run signaldesk-db backup --output data/backups/before-upgrade
+uv run signaldesk-db verify data/backups/before-upgrade
+uv run signaldesk-db restore data/backups/before-upgrade --target-dir data/restored-before-upgrade
+```
+
+目标目录必须不存在，父目录必须存在。备份覆盖业务、检查点和 Store；verify/restore 不加载 `.env`。恢复输出三条数据库 URL，检查后再手动切换配置；不覆盖旧库、不自动启动任务。Linux/macOS 本地文件系统受支持，PostgreSQL/混合后端、内存库、URI/query 和硬链接不支持。
+
+文件锁冲突返回 `storage_busy`，应停止另一个服务或维护命令。不要删除持久 `.signaldesk.lock` 文件来解除冲突。若返回 `publication_uncertain`，先 verify 目标目录；产物可能已经完整发布。备份含业务内容，应保存在私有位置。命令、格式、权限与协作边界见 [V0.4.7_UPGRADE.md](./V0.4.7_UPGRADE.md)。
 
 ## 5. MCP
 
@@ -197,7 +212,7 @@ uv run signaldesk-eval --output data/evaluation.json
 来源限制、引用拒绝、Deep Agents 实图与脚本模型、Skills 读取、只读 MCP 以及项目历史隔离。
 脚本模型只用于验证真实框架的调用接口，不代表真实模型效果。
 
-以下保留验证历史：V0.4.3 完整 Python 回归344项通过、前端行为测试12项通过；真实PostgreSQL测试7项、Docker测试3项，其中一项PG测试结合Docker。V0.4.4 完整回归427项通过、前端19项通过；真实PostgreSQL测试9项、Docker测试3项，详情见 [历史升级说明](./V0.4.4_UPGRADE.md)。V0.4.5 完整回归457项通过、前端32项通过；真实PostgreSQL测试11项、Docker测试3项，见 [V0.4.5 说明](./V0.4.5_UPGRADE.md)。V0.4.6 完整回归485项通过、前端42项通过；真实PostgreSQL测试12项、Docker测试3项，见 [本轮说明](./V0.4.6_UPGRADE.md)。真实集成测试按环境变量明确启用，缺少条件会跳过。
+以下保留验证历史：V0.4.3 完整 Python 回归344项通过、前端行为测试12项通过；真实PostgreSQL测试7项、Docker测试3项，其中一项PG测试结合Docker。V0.4.4 完整回归427项通过、前端19项通过；真实PostgreSQL测试9项、Docker测试3项，详情见 [历史升级说明](./V0.4.4_UPGRADE.md)。V0.4.5 完整回归457项通过、前端32项通过；真实PostgreSQL测试11项、Docker测试3项，见 [V0.4.5 说明](./V0.4.5_UPGRADE.md)。V0.4.6 完整回归485项通过、前端42项通过；真实PostgreSQL测试12项、Docker测试3项，见 [V0.4.6 说明](./V0.4.6_UPGRADE.md)。V0.4.7 完整回归587项通过、前端42项通过，真实PostgreSQL测试12项、Docker测试3项，并完成SQLite三库恢复演练，见 [本轮说明](./V0.4.7_UPGRADE.md)。真实集成测试按环境变量明确启用，缺少条件会跳过。
 实际数据库测试覆盖 GIN 全文、向量、Store、checkpointer 和应用整体；嵌入输入是确定性夹具，不调用供应商。
 Chrome 已验证 SSE 续传、项目切换、记忆 CRUD 和服务重启持久化。
 

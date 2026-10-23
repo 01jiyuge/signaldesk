@@ -4,7 +4,6 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import event, func, select, text
@@ -24,6 +23,7 @@ from signaldesk.db import (
     utcnow,
 )
 from signaldesk.history import before_position, decode_cursor, history_page
+from signaldesk.local_storage import sqlite_file_path
 from signaldesk.schemas import (
     EventRead,
     ProjectCreate,
@@ -121,10 +121,12 @@ def _run_summary(row) -> RunSummaryRead:
 class Repository:
     def __init__(self, settings: Settings):
         self.settings = settings
+        database = sqlite_file_path(settings.database_url)
         db_url = make_url(settings.database_url)
-        if db_url.get_backend_name() == "sqlite" and db_url.database not in (None, "", ":memory:"):
-            Path(db_url.database).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_async_engine(settings.database_url)
+        if database is not None:
+            database.parent.mkdir(parents=True, exist_ok=True)
+            db_url = db_url.set(database=str(database))
+        self.engine = create_async_engine(db_url)
         if db_url.get_backend_name() == "sqlite":
 
             @event.listens_for(self.engine.sync_engine, "connect")

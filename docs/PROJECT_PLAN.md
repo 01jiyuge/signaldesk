@@ -1,6 +1,6 @@
 # SignalDesk · 竞品情报 Agent 项目方案
 
-更新日期：2026-10-23。当前实现为 V0.4.6，本地单用户、单进程验证版本。本文保留产品目标和首期设计，历史能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)、[V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)、[V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)、[V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md) 和 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量运行历史、按需详情与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，本轮分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)。
+更新日期：2026-10-23。当前实现为 V0.4.7，本地单用户、单进程验证版本。本文保留产品目标和首期设计，历史能力与验收见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)、[V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)、[V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)、[V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md) 和 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量运行历史、按需详情与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)，本轮离线备份与恢复见 [V0.4.7_UPGRADE.md](./V0.4.7_UPGRADE.md)。
 
 > 本文中的“V0.1 目标”是验收要求，不代表所有目标已经验证。实现与验证状态见 [ROADMAP.md](./ROADMAP.md) 的状态表；接口和目录以 [ARCHITECTURE.md](./ARCHITECTURE.md) 及运行中的 OpenAPI 为准。演示数据必须标为夹具，不能作为真实市场情报。当前 verify 节点检查引用是否指向存在的证据、引文是否存在于原文；这不等于证明事实真实或推理成立。
 

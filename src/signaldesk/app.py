@@ -17,6 +17,7 @@ from signaldesk.checkpoints import open_checkpointer
 from signaldesk.config import Settings, get_settings
 from signaldesk.errors import PublicTaskError
 from signaldesk.jobs import JobManager
+from signaldesk.local_storage import normalized_storage_settings, sqlite_paths, storage_locks
 from signaldesk.memory import ProjectMemory, open_memory_store
 from signaldesk.memory_api import create_memory_router
 from signaldesk.repository import Repository
@@ -28,7 +29,7 @@ from signaldesk.workflow import Workflow
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
+    settings = normalized_storage_settings(settings or get_settings())
     repo = Repository(settings)
     retriever = Retriever(repo, settings)
     sandbox = SandboxService(repo, settings)
@@ -47,6 +48,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         nonlocal workflow
         async with AsyncExitStack() as resources:
+            # Hold ownership through every producer and database closer. The
+            # same locks also exclude an offline maintenance command.
+            resources.enter_context(storage_locks(sqlite_paths(settings)))
             # Register before initialization: a partially opened resource must
             # also close, and one failing closer must not skip the others.
             resources.push_async_callback(repo.close)

@@ -7,11 +7,11 @@
 
 Evidence-first competitive intelligence agents with durable workflows, project memory, hybrid retrieval, Docker Sandbox and A2A interoperability.
 
-当前版本 **0.4.6**：长任务事件分批回放，AG-UI 在日志排空后发送终态；JSON 回退按页续读，控制台仅显示最近 200 条事件；订阅暂时失败会继续重连。详见 [本轮说明](docs/V0.4.6_UPGRADE.md)。
+当前版本 **0.4.7**：新增 SQLite 业务库、检查点和项目记忆的统一离线备份、严格校验与新目录恢复；服务和维护命令通过本机协作锁互斥，路径配置在构造时冻结。详见 [本轮说明](docs/V0.4.7_UPGRADE.md)。
 
 ## 本地启动
 
-需要 Python 3.11–3.14 和 [uv](https://docs.astral.sh/uv/)。在项目目录运行：
+默认本地 SQLite 模式需要 Linux/macOS、Python 3.11–3.14 和 [uv](https://docs.astral.sh/uv/)。在项目目录运行：
 
 ```bash
 git clone https://github.com/01jiyuge/signaldesk.git
@@ -41,6 +41,7 @@ Northstar / Orbit 是虚构夹具，demo 不访问外网、不调用模型。
 - A2A：官方 SDK 1.2.2、协议 1.0 JSON-RPC 及 SDK 0.3 兼容，Agent Card、任务委托/查询/取消、持久幂等和远端白名单。
 - Deep Agents 可按需调用 `execute_python` 与已授权映射的 `delegate_research`；每次绑定当前项目/run，入站 A2A 研究禁止继续自动委托。
 - 前端「扩展能力」提供实际执行与委托表单，展示真实 stdout/stderr/JSON、任务状态与远端报告；历史首屏 20 条，支持加载更多、恢复页外选择和本地缓存详情。
+- `signaldesk-db backup / verify / restore` 提供三库离线备份、校验和新目录恢复；Linux/macOS 的服务与维护命令通过本机文件锁互斥。
 - `GET /api/capabilities` 查看本实例的检索、记忆、交互与扩展状态。
 - `/api` 与 `/a2a` 下的 `POST`、`PUT`、`PATCH` 在解析前限制请求体实际字节数；`MAX_REQUEST_BYTES` 默认 `1048576`（1 MiB），超限返回 413，非 `identity` 内容编码返回 415。
 
@@ -55,6 +56,7 @@ AG-UI 当前是业务任务的标准事件投影，未实现通用 `RunAgentInpu
 - [架构、API 与项目目录](docs/ARCHITECTURE.md)
 - [分阶段实施与当前状态](docs/ROADMAP.md)
 - [启动、配置和评测](docs/OPERATIONS.md)
+- [V0.4.7 SQLite 离线备份与恢复](docs/V0.4.7_UPGRADE.md)
 - [V0.4.6 分批事件回放](docs/V0.4.6_UPGRADE.md)
 - [V0.4.5 轻量历史与记忆范围](docs/V0.4.5_UPGRADE.md)
 - [V0.4.4 状态、索引与协议收尾](docs/V0.4.4_UPGRADE.md)
@@ -75,7 +77,7 @@ uv run signaldesk-mcp
 docker compose up --build
 ```
 
-V0.4.6 完整 Python 回归 **485 项通过**，包含真实 PostgreSQL **12 项**与真实 Docker **3 项**（一项 PostgreSQL 同时使用 Docker）；前端 **42/42**，Ruff/格式、JS 语法、锁文件检查通过；离线评测 **9/9 场景、55/55 项期望匹配**。 隔离 HTTP/浏览器验证 651 条合成事件的分批续读、最近 200 条窗口及重新连接 AG-UI；完整日志保留在服务端。轻量研究历史与记忆验证历史见 [V0.4.5 说明](docs/V0.4.5_UPGRADE.md)。
+V0.4.7 完整 Python 回归 **587 项通过**，包含真实 PostgreSQL **12 项**及 Docker **3 项**（其中一项 PostgreSQL 同时使用 Docker）；前端行为 **42/42**。Ruff/格式、JS 语法、依赖锁检查通过；离线评测 **9/9 场景、55/55 项期望匹配**。 已安装维护 CLI 完成三库备份、校验和恢复重启演练；报告内容一致，偏好与检查点保留。备份支持 Linux/macOS 的本地 SQLite，恢复只发布新目录；不覆盖现有数据。历史事件回放验证见 [V0.4.6 说明](docs/V0.4.6_UPGRADE.md)。
 GitHub Actions 已新增 PostgreSQL 与 Docker 真实集成任务；fork PR 保留离线检查。各次提交的实际结果见 [Actions](https://github.com/01jiyuge/signaldesk/actions/workflows/ci.yml)。
 没有使用真实模型、嵌入或远端 Reranker 密钥，也未上传 LangSmith；这些服务的效果仍需配置后验收。
 Docker 隔离与双实例 A2A 已实际运行。Compose 默认不开放 Docker socket，容器内 app 不自动获得宿主执行器权限；Sandbox 可先按原生 Python + Docker 路径运行。

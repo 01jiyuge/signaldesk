@@ -31,6 +31,7 @@ from langgraph.store.base import (
 from sqlalchemy.engine import make_url
 
 from signaldesk.config import Settings
+from signaldesk.local_storage import sqlite_file_path
 
 
 async def _finish_owned(operation):
@@ -294,6 +295,7 @@ class SQLiteStore(BaseStore):
 
 @asynccontextmanager
 async def open_memory_store(settings: Settings):
+    database = sqlite_file_path(settings.memory_url)
     url = make_url(settings.memory_url)
     if url.get_backend_name() in {"postgres", "postgresql"}:
         from langgraph.store.postgres import AsyncPostgresStore
@@ -302,9 +304,7 @@ async def open_memory_store(settings: Settings):
             await store.setup()
             yield store
     elif url.get_backend_name() == "sqlite" and url.database:
-        if url.query:
-            raise ValueError("SQLite memory URL query parameters are unsupported")
-        opening = asyncio.create_task(asyncio.to_thread(SQLiteStore, url.database))
+        opening = asyncio.create_task(asyncio.to_thread(SQLiteStore, database or ":memory:"))
         try:
             store = await asyncio.shield(opening)
         except asyncio.CancelledError:

@@ -1,6 +1,6 @@
 # SignalDesk 技术架构与接口
 
-范围：当前 V0.4.6，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，扩展历史与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量运行历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，本轮分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
+范围：当前 V0.4.7，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，扩展历史与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量运行历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)，本轮离线备份与恢复见 [V0.4.7_UPGRADE.md](./V0.4.7_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
 
 ## 1. 技术选择与边界
 
@@ -135,7 +135,9 @@ erDiagram
 
 `save_snapshot` 按快照 ID 合并写入，检查 ID 不跨项目/运行复用。`runs` 的部分唯一索引与应用锁保护项目活动运行约束；不同项目可在同一进程的有界并发池执行。项目锁按持有者和等待者计数，完成、异常或取消后回收，缺失项目 ID 不留下永久锁。历史比较只选择同项目、同来源 URL、已完成运行的最新快照，不以失败运行建立新基线。内容 hash 识别正文是否变化；每次运行仍可以留下快照和报告，当前不宣称具备跨运行“事件级去重账本”。
 
-应用数据库会话在请求或短事务内创建，不能在单例 Agent 中跨并发任务复用 SQLAlchemy session。SQLite 用于本地单进程验证；PostgreSQL 用于正式运行路径。多 worker、迁移和备份恢复需单独验证后再开放。
+应用数据库会话在请求或短事务内创建，不能在单例 Agent 中跨并发任务复用 SQLAlchemy session。SQLite 用于本地单进程验证；PostgreSQL 用于正式运行路径。SQLite 服务在首次初始化前持有各库的本机协作锁，资源全部关闭后释放；仅共享一个库的实例也互斥。构造时冻结配置，三个适配器与锁使用同一规范路径。多 worker、跨主机所有权与迁移仍需单独实现。
+
+`signaldesk-db` 提供本地 SQLite 三库离线备份、严格校验和新目录恢复；使用 SQLite backup API 保留 WAL 已提交内容，发布前校验完整性及哈希。恢复不覆盖现有库，不自动切配置；PostgreSQL 备份不在该命令范围内。协议只约束配合的服务与命令，外部写入者仍需停止。细节见 [V0.4.7_UPGRADE.md](./V0.4.7_UPGRADE.md)。
 
 ## 6. 模型、Skills 与工具边界
 
@@ -288,6 +290,9 @@ signaldesk/
 │   ├── errors.py               # 安全错误码与处理建议
 │   ├── jobs.py                 # 单进程有界任务池与取消/恢复状态
 │   ├── collector.py            # 夹具、公共地址检查与有限 HTML 抓取
+│   ├── local_storage.py        # 统一 SQLite 路径、配置冻结与本机文件锁
+│   ├── backups.py              # 三库离线备份、严格校验与新目录恢复
+│   ├── database_cli.py         # signaldesk-db 维护命令
 │   ├── checkpoints.py          # SQLite / PostgreSQL checkpointer
 │   ├── workflow.py             # 五阶段图与恢复逻辑
 │   ├── research.py             # Deep Agents、Skills 与引用一致性

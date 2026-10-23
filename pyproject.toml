@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "signaldesk"
-version = "0.4.6"
+version = "0.4.7"
 description = "Evidence-first competitive intelligence agents with LangGraph and Deep Agents"
 readme = "README.md"
 license = "MIT"
@@ -47,6 +47,7 @@ Documentation = "https://github.com/01jiyuge/signaldesk/tree/main/docs"
 signaldesk = "signaldesk.cli:main"
 signaldesk-mcp = "signaldesk.mcp_server:main"
 signaldesk-eval = "signaldesk.evaluation_cli:main"
+signaldesk-db = "signaldesk.database_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/signaldesk"]
