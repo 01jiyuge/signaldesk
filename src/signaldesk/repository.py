@@ -13,7 +13,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from signaldesk.config import Settings
-from signaldesk.db import RUN_HISTORY_INDEX, Base, Event, Project, Run, Snapshot, utcnow
+from signaldesk.db import (
+    EVENT_HISTORY_INDEX,
+    RUN_HISTORY_INDEX,
+    Base,
+    Event,
+    Project,
+    Run,
+    Snapshot,
+    utcnow,
+)
 from signaldesk.history import before_position, decode_cursor, history_page
 from signaldesk.schemas import (
     EventRead,
@@ -138,6 +147,9 @@ class Repository:
             # create_all skips indexes on tables that already exist. Upgrade an
             # older database without recreating its runs table or user data.
             await connection.run_sync(lambda sync: RUN_HISTORY_INDEX.create(sync, checkfirst=True))
+            await connection.run_sync(
+                lambda sync: EVENT_HISTORY_INDEX.create(sync, checkfirst=True)
+            )
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -308,6 +320,11 @@ class Repository:
             row = await session.get(Run, run_id)
             return _run(row) if row else None
 
+    async def run_exists(self, run_id: str) -> bool:
+        async with self.sessions() as session:
+            identifier = await session.scalar(select(Run.id).where(Run.id == run_id))
+        return identifier is not None
+
     async def list_runs(self, project_id: str | None = None) -> list[RunRead]:
         query = select(Run).order_by(Run.created_at.desc())
         if project_id is not None:
@@ -444,6 +461,37 @@ class Repository:
                 )
                 for row in rows
             ]
+
+    async def list_event_page(self, run_id: str, after: int = 0, limit: int = 100) -> dict:
+        if type(after) is not int or not 0 <= after <= MAX_EVENT_CURSOR:
+            raise ValueError("Event cursor must be within the database integer range")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("Event page size must be between 1 and 200")
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(Event)
+                    .where(Event.run_id == run_id, Event.id > after)
+                    .order_by(Event.id)
+                    .limit(limit + 1)
+                )
+            ).all()
+        items = [
+            EventRead(
+                id=row.id,
+                run_id=row.run_id,
+                kind=row.kind,
+                message=row.message,
+                data=row.data,
+                created_at=_iso(row.created_at),
+            )
+            for row in rows[:limit]
+        ]
+        return {
+            "items": items,
+            "next_after": items[-1].id if items else after,
+            "has_more": len(rows) > limit,
+        }
 
     async def save_snapshot(self, snapshot: SnapshotRecord) -> None:
         values = snapshot.model_dump(mode="python")

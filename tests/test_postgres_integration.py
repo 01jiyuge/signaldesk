@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from signaldesk.collector import content_hash
 from signaldesk.config import Settings
-from signaldesk.db import Run, Snapshot
+from signaldesk.db import EVENT_HISTORY_INDEX, Event, Run, Snapshot
 from signaldesk.repository import Repository
 from signaldesk.retrieval import Retriever
 from signaldesk.schemas import ProjectCreate, RunCreate, SnapshotRecord
@@ -732,3 +732,92 @@ async def test_postgres_memory_exact_reads_skip_descendants_and_return_bounded_s
             monkeypatch.setattr(memory, "load_context", refuse_incomplete)
             response = await client.get(path)
             assert response.status_code == 409 and "bounded scan" in response.json()["detail"]
+
+
+async def test_postgres_event_pages_seek_safely_and_upgrade_existing_index(postgres_schema):
+    from fastapi import FastAPI
+
+    from signaldesk.api import create_router
+    from signaldesk.jobs import JobManager
+    from signaldesk.repository import MAX_EVENT_CURSOR
+
+    repo, settings, schema, _ = postgres_schema
+    own = await project(repo, "Event replay")
+    other = await project(repo, "Other events")
+    run = await repo.create_run(own.id, RunCreate())
+    foreign = await repo.create_run(other.id, RunCreate())
+    at = datetime(2026, 10, 23, tzinfo=UTC)
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            insert(Event),
+            [
+                {
+                    "run_id": target.id,
+                    "kind": "stage",
+                    "message": f"PRIVATE_EVENT_BODY_{number}",
+                    "data": {"stage": "collect", "raw_exception": "PRIVATE_EVENT_BODY"},
+                    "created_at": at,
+                }
+                for number in range(253)
+                for target in (run, foreign)
+            ],
+        )
+        await conn.execute(text(f'DROP INDEX "{schema}"."{EVENT_HISTORY_INDEX.name}"'))
+    await repo.initialize()
+    await repo.initialize()
+    async with repo.engine.connect() as conn:
+        definition = await conn.scalar(
+            text("SELECT indexdef FROM pg_indexes WHERE schemaname=:schema AND indexname=:name"),
+            {"schema": schema, "name": EVENT_HISTORY_INDEX.name},
+        )
+    assert "(run_id, id)" in definition
+    expected = await repo.list_events(run.id)
+    assert len(expected) == 254
+
+    async def forbidden_runner(*_args, **_kwargs):
+        raise AssertionError("Event paging cannot start research")
+
+    jobs = JobManager(repo, forbidden_runner)
+    app = FastAPI()
+    token = "pg-event-fixture-token"
+    app.include_router(create_router(repo, jobs, settings.model_copy(update={"api_token": token})))
+    auth = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://fixture"
+        ) as client:
+            path = f"/api/runs/{run.id}/events/page"
+            assert (await client.get(path)).status_code == 401
+            first = await client.get(path, headers=auth)
+            assert first.status_code == 200 and "PRIVATE_EVENT_BODY" not in first.text
+            page = first.json()
+            assert len(page["items"]) == 100 and page["has_more"]
+            seen = [item["id"] for item in page["items"]]
+            assert seen == [item.id for item in expected[:100]]
+            appended = await repo.append_event(run.id, "completed", "Finished after page one")
+            after = page["next_after"]
+            while page["has_more"]:
+                page = (await client.get(path, headers=auth, params={"after": after})).json()
+                assert all(
+                    item["run_id"] == run.id and item["id"] > after for item in page["items"]
+                )
+                seen.extend(item["id"] for item in page["items"])
+                after = page["next_after"]
+            assert seen == [item.id for item in expected] + [appended.id]
+            assert len(seen) == len(set(seen))
+            assert (await client.get(path, headers=auth, params={"after": after})).json() == {
+                "items": [],
+                "next_after": after,
+                "has_more": False,
+                "producer_active": False,
+            }
+            maximum = await client.get(path, headers=auth, params={"after": MAX_EVENT_CURSOR})
+            assert maximum.status_code == 200 and maximum.json()["next_after"] == MAX_EVENT_CURSOR
+            assert (
+                await client.get(path, headers=auth, params={"after": MAX_EVENT_CURSOR + 1})
+            ).status_code == 422
+            assert (await client.get(path, headers=auth, params={"limit": 201})).status_code == 422
+            legacy = await client.get(f"/api/runs/{run.id}/events", headers=auth)
+            assert isinstance(legacy.json(), list) and "PRIVATE_EVENT_BODY" in legacy.text
+    finally:
+        await jobs.shutdown()

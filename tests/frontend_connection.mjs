@@ -256,7 +256,7 @@ test("JSON fallback completion preserves successful evidence search and its quer
   const ui = harness(({ url }) => {
     if (url.includes("/search?")) return json([{ evidence_id: "hit", source_name: "History", url: "https://fixture.example/history", title: "ALPHA_SEARCH_RESULT", text: "Matched historical evidence" }]);
     if (url === "/api/runs/r") return json(run("completed"));
-    if (url.includes("/runs/r/events?")) return json([]);
+    if (url.includes("/runs/r/events/page?")) return json({ items: [], next_after: 0, has_more: false, producer_active: false });
     throw new Error(`Unexpected HTTP request: ${url}`);
   });
   const active = run("running"); Object.assign(ui.production.state, { run: active, runs: [active], streamSupported: false });

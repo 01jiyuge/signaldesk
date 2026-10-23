@@ -92,6 +92,13 @@ class EventRead(BaseModel):
     created_at: str
 
 
+class EventPage(BaseModel):
+    items: list[EventRead]
+    next_after: int
+    has_more: bool
+    producer_active: bool
+
+
 class SnapshotRecord(BaseModel):
     id: str
     run_id: str

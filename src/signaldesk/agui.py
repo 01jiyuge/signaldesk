@@ -33,6 +33,8 @@ from signaldesk.schemas import EventRead, RunRead
 
 POLL_INTERVAL_SECONDS = 0.25
 HEARTBEAT_INTERVAL_SECONDS = 15.0
+EVENT_BATCH_SIZE = 100
+EVENT_FAIRNESS_INTERVAL = 25
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024 - 4096
 MAX_CURSOR = MAX_EVENT_CURSOR
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
@@ -159,8 +161,16 @@ async def stream_run(
     last_write = time.monotonic()
     try:
         while not await request.is_disconnected():
-            events = await repo.list_events(initial.id, after=cursor)
-            for event in events:
+            previous_cursor = cursor
+            page = await repo.list_event_page(initial.id, after=cursor, limit=EVENT_BATCH_SIZE)
+            events = page["items"]
+            if len(events) > EVENT_BATCH_SIZE:
+                raise ValueError("Event page exceeds its requested bound")
+            for index, event in enumerate(events):
+                if index and index % EVENT_FAIRNESS_INTERVAL == 0:
+                    await asyncio.sleep(0)
+                    if await request.is_disconnected():
+                        return
                 if event.run_id != initial.id or event.id <= cursor:
                     continue
                 safe = public_event(event)
@@ -175,6 +185,14 @@ async def stream_run(
                 )
                 cursor = event.id
                 last_write = time.monotonic()
+            if page["has_more"]:
+                if cursor == previous_cursor:
+                    raise ValueError("Event page made no progress")
+                # Drain backlog before examining terminal state. A completed
+                # report may still have several pages of business events, and
+                # only delivered CUSTOM frames may advance the resume cursor.
+                await asyncio.sleep(0)
+                continue
             current = await repo.get_run(initial.id)
             if current is None:
                 yield _frame(encoder, RunErrorEvent(message="任务不存在。", code="run_not_found"))

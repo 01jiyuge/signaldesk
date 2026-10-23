@@ -24,7 +24,7 @@ function browser(custom, records = rows) {
     const { url } = call;
     if (url.endsWith("/memory")) return json({ preferences: [], recent_runs: [] });
     if (url.includes("/executions/page") || url.includes("/delegations/page")) return json({ items: [], next_cursor: null, has_more: false });
-    if (url.includes("/events?")) return json([]);
+    if (url.includes("/events/page?")) return json({ items: [], next_after: 0, has_more: false, producer_active: false });
     const id = url.match(/^\/api\/runs\/([^/?]+)/)?.[1]; const item = records.find((entry) => entry.id === id);
     if (url.includes("/ag-ui?") && item) return finish(item);
     if (/^\/api\/runs\/[^/?]+$/.test(url) && item) return json(item);

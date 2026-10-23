@@ -9,13 +9,17 @@
   const changeNames = { baseline: "首次记录", changed: "检测到变化", unchanged: "与上次一致", new: "新增来源" };
   const stageNames = { collect: "采集原始来源", collecting: "采集原始来源", fetch: "采集原始来源", compare: "比较历史快照", analyze: "分析变化与影响", analyzing: "分析变化与影响", research: "开展自主调研", verify: "检查引用一致性", verify_evidence: "检查引用一致性", report: "整理研究报告", persist: "保存研究记录", completed: "研究已完成", queued: "任务已加入队列", running: "研究正在进行" };
   const stages = ["collect", "compare", "research", "verify", "persist"];
+  const eventWindowSize = 200;
+  const eventPageSize = 100;
+  const eventPagesPerTurn = 3;
+  const maxEventCursor = 2147483647;
   const state = { projects: [], project: null, runs: [], run: null, events: [], eventAfter: 0, health: null, tab: "report", timer: null, epoch: 0, actionBusy: false, exportBusy: false, runsLoading: false, runGenerations: new Map(), searchEpoch: 0, searchQuery: "", searchController: null, pollingError: "", editProjectId: null, projectFormEpoch: 0, extraFocus: [], disconnected: false, connectionEpoch: 0, connectionStatus: "connecting", connectionBlocked: true, connectionController: null, streamController: null, streamTimer: null, streamRunId: null, streamStatus: "idle", streamSupported: null, backgroundStreams: new Map() };
   let toastTimer;
   let memoryEpoch = 0;
   let memoryBusy = false;
   let memoryController = null;
   let memoryFormEpoch = 0;
-  Object.assign(state, { history: null, selectedRunId: null, detailLoading: false, detailError: "", detailController: null });
+  Object.assign(state, { history: null, selectedRunId: null, detailLoading: false, detailError: "", detailController: null, eventHasMore: false, eventProducerActive: false, eventLoad: null });
   const extensions = { capabilities: null, capabilityError: "", loading: false, capabilityEpoch: 0, context: null, submissions: new Map() };
   const sandboxActive = new Set(["queued", "running", "pending", "cancelling", "canceling"]);
   const delegationActive = new Set(["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"]);
@@ -292,6 +296,7 @@
     if (state.history) state.history.activityVersion++;
     const generation = runGeneration(runId) + 1; state.runGenerations.set(runId, generation);
     if (state.run?.id === runId) {
+      stopEventReplay(); state.eventProducerActive = false;
       stopPolling(); state.streamController?.abort(); state.streamController = null;
       clearTimeout(state.streamTimer); state.streamTimer = null; state.streamRunId = null; state.streamStatus = "idle";
     }
@@ -355,11 +360,14 @@
     const list = $("event-list");
     const runKey = run?.id || "";
     if (list.dataset.runId !== runKey) { list.replaceChildren(); list.dataset.runId = runKey; }
-    const previousCount = list.childElementCount;
     const wasNearEnd = list.scrollTop + list.clientHeight >= list.scrollHeight - 50;
-    // Append only new events so screen readers do not repeat the whole history each poll.
-    const additions = state.events.slice(previousCount).map((event) => {
+    const visibleIds = new Set(state.events.map((event) => String(event.id)));
+    // Remove expired rows and append new rows without re-announcing retained events.
+    for (const item of Array.from(list.children)) if (!visibleIds.has(item.dataset.eventId)) list.removeChild(item);
+    const renderedIds = new Set(Array.from(list.children, (item) => item.dataset.eventId));
+    const additions = state.events.filter((event) => !renderedIds.has(String(event.id))).map((event) => {
       const item = node("li", `event${/error|fail|warning/.test(event.kind) ? " error" : ""}`);
+      item.dataset.eventId = String(event.id);
       const time = node("time", "", timeOnly(event.created_at));
       if (event.created_at) time.dateTime = event.created_at;
       item.append(node("strong", "", event.message || event.kind), time);
@@ -370,7 +378,9 @@
       return item;
     });
     list.append(...additions);
-    if (state.events.length > previousCount && wasNearEnd) list.scrollTop = list.scrollHeight;
+    if (additions.length && wasNearEnd) list.scrollTop = list.scrollHeight;
+    $("event-window-note").hidden = !run;
+    $("event-replay-status").textContent = state.eventLoad || state.eventHasMore ? "正在分批补读执行事件…" : state.eventProducerActive ? "正在等待任务写入最后执行事件…" : "";
   }
 
   function viewCitation(id) {
@@ -549,6 +559,7 @@
   }
 
   function stopTransport() {
+    stopEventReplay(); state.eventProducerActive = false;
     stopPolling();
     if (state.streamTimer) clearTimeout(state.streamTimer);
     state.streamTimer = null;
@@ -635,13 +646,28 @@
     if (reportPending) throw new Error(reportPendingError);
   }
 
+  function validEvent(event, runId) {
+    return event && Number.isSafeInteger(event.id) && event.id > 0 && event.id <= maxEventCursor && event.run_id === runId
+      && typeof event.kind === "string" && typeof event.message === "string" && typeof event.created_at === "string"
+      && event.data !== null && typeof event.data === "object" && !Array.isArray(event.data);
+  }
+
+  function streamEventCursor(event, cursor, runId) {
+    if (!validEvent(event, runId) || (cursor !== null && (!/^\d+$/.test(String(cursor)) || Number(cursor) !== event.id))) throw new Error("执行事件或恢复游标无效，已保留此前记录。");
+    return event.id;
+  }
+
+  function retainEvents(events, cursor) {
+    const known = new Set(state.events.map((event) => event.id));
+    state.events = [...state.events, ...events.filter((event) => !known.has(event.id))].slice(-eventWindowSize);
+    state.eventAfter = cursor;
+    renderProgress();
+  }
+
   function appendStreamEvent(event, cursor, runId, epoch) {
-    if (epoch !== state.epoch || state.run?.id !== runId || event?.run_id !== runId || !Number.isSafeInteger(event.id) || event.id < 0) return;
-    if (!state.events.some((existing) => existing.id === event.id)) {
-      state.events.push(event); renderProgress();
-    }
-    const received = Number(cursor);
-    state.eventAfter = Math.max(state.eventAfter, event.id, Number.isSafeInteger(received) ? received : 0);
+    if (epoch !== state.epoch || state.run?.id !== runId) return;
+    const received = streamEventCursor(event, cursor, runId);
+    if (received > state.eventAfter) retainEvents([event], received);
   }
 
   async function streamResponse(runId, cursor, controller) {
@@ -657,7 +683,7 @@
 
   async function startSelectedStream(epoch) {
     if (epoch !== state.epoch || !state.run || state.connectionBlocked) return;
-    stopPolling();
+    stopPolling(); stopEventReplay(); state.eventHasMore = false; state.eventProducerActive = false;
     const runId = state.run.id; const projectId = state.project.id;
     const background = state.backgroundStreams.get(runId);
     if (background) { background.controller?.abort(); clearTimeout(background.timer); state.backgroundStreams.delete(runId); }
@@ -676,6 +702,7 @@
         if (event.type === "RUN_STARTED" && (event.runId !== runId || event.threadId !== projectId)) throw new Error("AG-UI 任务标识不匹配，已停止订阅。");
         if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, runId, epoch, true, generation);
         if (event.type === "CUSTOM" && event.name === "signaldesk.event") appendStreamEvent(event.value, cursor, runId, epoch);
+        if (event.type === "RUN_ERROR" && event.code === "stream_unavailable") throw new Error("事件订阅暂时不可用。");
         if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
           if (event.type === "RUN_FINISHED" && (event.runId !== runId || event.threadId !== projectId)) throw new Error("AG-UI 结束事件标识不匹配。");
           terminal = true;
@@ -728,8 +755,9 @@
             if (epoch !== state.epoch || generation !== runGeneration(run.id) || state.backgroundStreams.get(run.id) !== stream) return true;
             if (event.type === "STATE_SNAPSHOT") await applySnapshot(event.snapshot, run.id, epoch, false, generation);
             if (event.type === "CUSTOM" && event.name === "signaldesk.event" && event.value?.run_id === run.id) {
-              const received = Number(cursor); if (Number.isSafeInteger(received)) stream.cursor = Math.max(stream.cursor, received);
+              stream.cursor = Math.max(stream.cursor, streamEventCursor(event.value, cursor, run.id));
             }
+            if (event.type === "RUN_ERROR" && event.code === "stream_unavailable") throw new Error("后台事件订阅暂时不可用。");
             if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") { terminal = true; return true; }
             return false;
           }, controller.signal);
@@ -781,17 +809,43 @@
   function schedulePoll(epoch) {
     stopPolling();
     if (state.streamSupported !== false || state.connectionBlocked) return;
-    if ((!isActive() && !projectActive() && !state.pollingError) || epoch !== state.epoch) return;
-    state.timer = setTimeout(() => pollRun(epoch), state.pollingError ? 4000 : 1000);
+    if ((!isActive() && !projectActive() && !state.eventHasMore && !state.eventProducerActive && !state.pollingError) || epoch !== state.epoch) return;
+    state.timer = setTimeout(() => pollRun(epoch), state.pollingError ? 4000 : state.eventHasMore ? 100 : 1000);
   }
 
-  async function loadEvents(runId, epoch) {
-    const result = await api(`/runs/${encodeURIComponent(runId)}/events?after=${encodeURIComponent(state.eventAfter)}`);
-    if (epoch !== state.epoch || state.run?.id !== runId) return;
-    const events = collection(result, "events");
-    const known = new Set(state.events.map((event) => String(event.id)));
-    state.events.push(...events.filter((event) => !known.has(String(event.id))));
-    events.forEach((event) => { const value = Number(event.id); if (Number.isFinite(value)) state.eventAfter = Math.max(state.eventAfter, value); });
+  function stopEventReplay() {
+    state.eventLoad?.controller.abort(); state.eventLoad = null;
+  }
+
+  async function loadEvents(runId, epoch, generation) {
+    const previous = state.eventLoad;
+    if (previous && previous.runId === runId && previous.epoch === epoch && previous.generation === generation) return previous.promise;
+    stopEventReplay();
+    const load = { runId, epoch, generation, controller: new AbortController(), promise: null };
+    const current = () => state.eventLoad === load && !load.controller.signal.aborted && epoch === state.epoch && generation === runGeneration(runId) && state.run?.id === runId && state.streamSupported === false;
+    state.eventLoad = load;
+    load.promise = (async () => {
+      for (let page = 0; page < eventPagesPerTurn; page++) {
+        const after = state.eventAfter;
+        const result = await api(`/runs/${encodeURIComponent(runId)}/events/page?after=${after}&limit=${eventPageSize}`, { signal: load.controller.signal });
+        if (!current()) return false;
+        if (!result || !Array.isArray(result.items) || result.items.length > eventPageSize || typeof result.has_more !== "boolean" || typeof result.producer_active !== "boolean" || !Number.isSafeInteger(result.next_after) || result.next_after < after || result.next_after > maxEventCursor) throw new Error("执行事件分页格式无效，已保留此前记录。");
+        let cursor = after;
+        for (const event of result.items) {
+          if (!validEvent(event, runId) || event.id <= cursor) throw new Error("执行事件顺序或任务标识无效，已保留此前记录。");
+          cursor = event.id;
+        }
+        if (result.next_after !== cursor || (result.has_more && cursor === after)) throw new Error("执行事件分页游标无效，已保留此前记录。");
+        state.eventHasMore = result.has_more;
+        state.eventProducerActive = result.producer_active;
+        retainEvents(result.items, cursor);
+        if (!result.has_more) break;
+      }
+      return current();
+    })();
+    renderProgress();
+    try { return await load.promise; }
+    finally { if (state.eventLoad === load) { state.eventLoad = null; renderProgress(); } }
   }
 
   async function pollRun(epoch) {
@@ -813,7 +867,7 @@
       state.run = run;
       renderRun(!selectedChanged);
       if (selectedChanged && run.report && !$("evidence-query").value.trim()) renderEvidence();
-      await loadEvents(runId, epoch);
+      if (!await loadEvents(runId, epoch, generation)) return;
       if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId) return;
       state.pollingError = "";
       renderRun(!selectedChanged);
@@ -824,7 +878,7 @@
       }
       schedulePoll(epoch);
     } catch (error) {
-      if (epoch !== state.epoch || generation !== runGeneration(runId)) return;
+      if (epoch !== state.epoch || generation !== runGeneration(runId) || state.run?.id !== runId || state.streamSupported !== false || error.name === "AbortError") return;
       state.pollingError = `进度暂时无法更新：${error.message} 已有任务状态和结果仍保留，4 秒后自动重试。`;
       renderPollingError(); renderExport();
       schedulePoll(epoch);
@@ -951,7 +1005,7 @@
     if (history) history.selectionEpoch++;
     state.selectedRunId = runId; state.detailLoading = true; state.detailError = "";
     runSelectionStorage(state.project.id, runId);
-    state.events = []; state.eventAfter = 0; state.pollingError = ""; resetSearch();
+    state.events = []; state.eventAfter = 0; state.eventHasMore = false; state.eventProducerActive = false; state.pollingError = ""; resetSearch();
     $("evidence-query").value = "";
     state.run = state.runs.find((run) => run.id === runId) || null;
     renderRun(); renderEvidence();
@@ -987,7 +1041,7 @@
     stopRunHistory();
     stopExtensionObservers();
     state.epoch++;
-    state.project = project; state.runs = []; state.run = null; state.events = []; state.eventAfter = 0; state.pollingError = ""; state.runsLoading = true; resetSearch();
+    state.project = project; state.runs = []; state.run = null; state.events = []; state.eventAfter = 0; state.eventHasMore = false; state.eventProducerActive = false; state.pollingError = ""; state.runsLoading = true; resetSearch();
     state.selectedRunId = runSelectionStorage(project.id) || null; state.detailLoading = false; state.detailError = "";
     const history = { projectId: project.id, connectionEpoch: state.connectionEpoch, ids: [], nextCursor: null, hasMore: false, loading: false, loaded: false, error: "", mode: "refresh", controller: null, epoch: 0, selectionEpoch: 0, activeId: null, activityKnown: false, activityError: "", activityVersion: 0, activitySequence: 0, watchController: null };
     state.history = history;

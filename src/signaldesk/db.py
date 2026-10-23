@@ -78,3 +78,6 @@ class Event(Base):
     message: Mapped[str] = mapped_column(Text)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+EVENT_HISTORY_INDEX = Index("ix_events_run_id_id", Event.run_id, Event.id)

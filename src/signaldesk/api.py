@@ -19,6 +19,7 @@ from signaldesk.repository import (
     RunConfigurationError,
 )
 from signaldesk.schemas import (
+    EventPage,
     EventRead,
     ProjectCreate,
     ProjectRead,
@@ -222,6 +223,28 @@ def create_router(repo: Repository, jobs: JobManager, settings: Settings) -> API
     async def get_events(run_id: str, after: int = Query(default=0, ge=0, le=MAX_EVENT_CURSOR)):
         await require_run(run_id)
         return await repo.list_events(run_id, after)
+
+    @protected.get("/runs/{run_id}/events/page", response_model=EventPage)
+    async def get_event_page(
+        run_id: str,
+        after: int = Query(default=0, ge=0, le=MAX_EVENT_CURSOR),
+        limit: int = Query(default=100, ge=1, le=200),
+    ):
+        # AG-UI and REST expose the same safe business-event projection. Import
+        # at call time so the protocol transport remains independent of routes.
+        from signaldesk.agui import public_event
+
+        if not await repo.run_exists(run_id):
+            raise HTTPException(status_code=404, detail="任务不存在。")
+        # Sample before querying: the producer may commit a final event and
+        # finish immediately after this page's database snapshot was read.
+        producer_active = jobs.is_active(run_id)
+        page = await repo.list_event_page(run_id, after=after, limit=limit)
+        return {
+            **page,
+            "items": [public_event(item) for item in page["items"]],
+            "producer_active": producer_active,
+        }
 
     @protected.post(
         "/runs/{run_id}/resume", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED

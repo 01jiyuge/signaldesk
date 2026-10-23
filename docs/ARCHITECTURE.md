@@ -1,6 +1,6 @@
 # SignalDesk 技术架构与接口
 
-范围：当前 V0.4.5，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，扩展历史与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。本轮轻量运行历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
+范围：当前 V0.4.6，沿用单用户、单进程执行架构。本文按仓库中的配置、SQLAlchemy 模型、Pydantic schema 和 HTTP 路由编写；Sandbox/A2A 基础见 [V0.4_UPGRADE.md](./V0.4_UPGRADE.md)，任务生命周期和请求体限额见 [V0.4.1_UPGRADE.md](./V0.4.1_UPGRADE.md)，扩展历史与旧库升级见 [V0.4.2_UPGRADE.md](./V0.4.2_UPGRADE.md)，采集和输入边界见 [V0.4.3_UPGRADE.md](./V0.4.3_UPGRADE.md)，状态和协议收尾见 [V0.4.4_UPGRADE.md](./V0.4.4_UPGRADE.md)。轻量运行历史与记忆范围见 [V0.4.5_UPGRADE.md](./V0.4.5_UPGRADE.md)，本轮分批事件回放见 [V0.4.6_UPGRADE.md](./V0.4.6_UPGRADE.md)，最终运行验收记录在 [ROADMAP.md](./ROADMAP.md)。
 
 ## 1. 技术选择与边界
 
@@ -209,7 +209,8 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 | 旧运行列表 | `GET /api/runs?project_id=...` | 保留兼容，project_id 可选；全量 RunRead 数组含 report，新控制台使用分页接口 |
 | 运行状态与报告 | `GET /api/runs/{run_id}` | 返回 RunRead；报告保存在 report 字段，没有独立 /report 路由 |
 | 导出报告 | `GET /api/runs/{run_id}/export?format=markdown\|json` | 完整的已完成报告作为附件下载；认证与其他业务 API 相同 |
-| 增量事件 | `GET /api/runs/{run_id}/events?after=N` | 只返回此运行 id>N 的事件数组；after 范围为 0–2147483647 |
+| 事件分页 | `GET /api/runs/{run_id}/events/page?after=N&limit=100` | 安全事件 items、next_after、has_more、查询前采样的 producer_active；limit 1–200，空页保持 after；数据库读取最多 limit+1 条 |
+| 旧增量事件 | `GET /api/runs/{run_id}/events?after=N` | 只返回此运行 id>N 的事件数组；after 范围为 0–2147483647 |
 | AG-UI 事件流 | `GET /api/runs/{run_id}/ag-ui?after=N` | `text/event-stream`；Last-Event-ID 与 after 使用相同数据库游标范围，越界 422 |
 | 项目记忆 | `GET /api/projects/{project_id}/memory?limit=10` | 明确偏好与最近运行摘要；有界扫描不能证明完整时返回 409 |
 | 单项偏好 | `GET/PUT/DELETE /api/projects/{project_id}/memory/{key}` | PUT 接收 `{ "value": { ... } }`，DELETE 成功 204 |
@@ -228,7 +229,9 @@ collect 首次执行冻结当时的偏好与最近 5 条摘要，恢复复用原
 
 先 POST 创建业务运行，再订阅该运行。服务发送官方模型编码的 `RUN_STARTED`、`STATE_SNAPSHOT`、`STEP_STARTED/FINISHED`、`CUSTOM(name="signaldesk.event")`、`RUN_FINISHED` 或 `RUN_ERROR`。AG-UI 的 threadId 为项目 ID、runId 为业务运行 ID；图检查点线程仍是运行 ID。
 
-只对业务日志 CUSTOM 事件附持久化 SSE id，重连用 `after` 或 Last-Event-ID 续传；初始状态快照可重复，前端按 ID 去重。终态事件等待本地任务完成 Store 与日志写入后发送，不以固定 250ms 推断写入完成。超过 2MB 的报告从快照省略，由 REST 获取。内部配置、记忆上下文、原始异常不投影到事件流。
+只对业务日志 CUSTOM 事件附持久化 SSE id，重连用 `after` 或 Last-Event-ID 续传；初始状态快照可重复，前端按 ID 去重。事件按每批最多 100 条回放，仍有积压时让出事件循环并继续读取。终态事件等待本地任务完成 Store 与日志写入、并排空积压后发送，不以固定 250ms 推断写入完成。超过 2MB 的报告从快照省略，由 REST 获取。内部配置、记忆上下文、原始异常不投影到事件流。
+JSON 回退每轮最多读取 3 页，has_more 或 producer_active 为真时继续续读，即使报告已保存也等生产任务的最终日志写入完成。控制台的事件数组和 DOM 仅保留最近 200 条，完整事件仍在服务端；窗口裁剪不回退确认游标。stream_unavailable 表示观察失败，需要重连，不能当作后台研究已失败。
+
 断开订阅只停止观察；取消运行需显式调用 cancel。当前不是通用 `RunAgentInput` POST 端点，也没有聊天 token 流或人工审批事件。
 
 ### 请求与报告结构

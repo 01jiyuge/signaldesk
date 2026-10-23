@@ -42,7 +42,7 @@ test("an old JSON poll cannot undo fresh observation after a cancellation reques
   const ui = harness(({ url }) => {
     if (url === "/api/runs/r") return ++reads === 1 ? oldPoll.promise : json(at("completed", "123300"));
     if (url === "/api/runs/r/cancel") return json({ detail: "Task already completed" }, 409);
-    if (url.includes("/events?")) return json([]);
+    if (url.includes("/events/page?")) return json({ items: [], next_after: 0, has_more: false, producer_active: false });
     throw new Error(`Unexpected HTTP request: ${url}`);
   });
   const active = at("running", "123100"); Object.assign(ui.production.state, { run: active, runs: [active], streamSupported: false });

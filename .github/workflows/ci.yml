@@ -25,6 +25,7 @@ jobs:
       - run: node --test tests/frontend_connection.mjs
       - run: node --test tests/frontend_run_races.mjs
       - run: node --test tests/frontend_run_history.mjs
+      - run: node --test tests/frontend_event_replay.mjs
 
   integration:
     name: PostgreSQL and Docker integration

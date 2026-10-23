@@ -7,7 +7,7 @@
 
 Evidence-first competitive intelligence agents with durable workflows, project memory, hybrid retrieval, Docker Sandbox and A2A interoperability.
 
-当前版本 **0.4.5**：研究历史改为不含报告的轻量游标分页，详情按需读取，独立返回页外活动任务；旧库补建历史索引，启动恢复仅扫描活动任务；项目记忆完善精确命名空间、类别配额和有界完整扫描。详见 [本轮说明](docs/V0.4.5_UPGRADE.md)。
+当前版本 **0.4.6**：长任务事件分批回放，AG-UI 在日志排空后发送终态；JSON 回退按页续读，控制台仅显示最近 200 条事件；订阅暂时失败会继续重连。详见 [本轮说明](docs/V0.4.6_UPGRADE.md)。
 
 ## 本地启动
 
@@ -35,7 +35,7 @@ Northstar / Orbit 是虚构夹具，demo 不访问外网、不调用模型。
 - Checkpointer 保存节点进度；Store 按项目保存明确偏好与运行摘要，重启后保留。偏好变化会重新触发研究。
 - 词法 + PostgreSQL 全文/GIN（本地 SQLite 使用 FTS5）+ 可选 pgvector，RRF 融合后重排。
 - Reranker 默认 `lexical` 确定性基线，可改为 `http` 接入模型重排服务；默认没有加载神经重排模型。
-- AG-UI 标准事件经 SSE 订阅已有任务，支持游标续传、断线重连和 Bearer；JSON 轮询作为明确标识的兼容回退。
+- AG-UI 标准事件经 SSE 分批订阅已有任务，支持游标续传、断线重连和 Bearer；JSON 回退使用安全事件页，控制台保留最近 200 条显示窗口。
 - `signaldesk-eval` 默认离线运行固定夹具；`--langsmith` 显式上传指标并创建实验。真实任务追踪可另行开启。
 - Sandbox：容器内执行 Python/JSON，离线、非 root、只读根目录、资源/输出限制、超时/取消清理、持久执行审计。
 - A2A：官方 SDK 1.2.2、协议 1.0 JSON-RPC 及 SDK 0.3 兼容，Agent Card、任务委托/查询/取消、持久幂等和远端白名单。
@@ -55,6 +55,7 @@ AG-UI 当前是业务任务的标准事件投影，未实现通用 `RunAgentInpu
 - [架构、API 与项目目录](docs/ARCHITECTURE.md)
 - [分阶段实施与当前状态](docs/ROADMAP.md)
 - [启动、配置和评测](docs/OPERATIONS.md)
+- [V0.4.6 分批事件回放](docs/V0.4.6_UPGRADE.md)
 - [V0.4.5 轻量历史与记忆范围](docs/V0.4.5_UPGRADE.md)
 - [V0.4.4 状态、索引与协议收尾](docs/V0.4.4_UPGRADE.md)
 - [V0.4.3 采集、检索与交互边界](docs/V0.4.3_UPGRADE.md)
@@ -74,7 +75,7 @@ uv run signaldesk-mcp
 docker compose up --build
 ```
 
-V0.4.5 完整 Python 回归 **457 项通过**，包含真实 PostgreSQL **11 项**和真实 Docker **3 项**；前端行为测试 **32/32 通过**，离线评测 **9/9 场景、55/55 项期望匹配**。27 条合成历史记录的浏览器验收覆盖首屏 20 条、加载至 27 条、页外旧选择重载恢复和后台任务完成后解锁。相同夹具的历史列表响应由旧接口约 **2.63 MB** 降至分页摘要约 **5.8 KB**，选中报告另行按需读取；这只比较历史列表响应，不代表整个页面流量或耗时。历史验证见 [V0.4.4 说明](docs/V0.4.4_UPGRADE.md)。
+V0.4.6 完整 Python 回归 **485 项通过**，包含真实 PostgreSQL **12 项**与真实 Docker **3 项**（一项 PostgreSQL 同时使用 Docker）；前端 **42/42**，Ruff/格式、JS 语法、锁文件检查通过；离线评测 **9/9 场景、55/55 项期望匹配**。 隔离 HTTP/浏览器验证 651 条合成事件的分批续读、最近 200 条窗口及重新连接 AG-UI；完整日志保留在服务端。轻量研究历史与记忆验证历史见 [V0.4.5 说明](docs/V0.4.5_UPGRADE.md)。
 GitHub Actions 已新增 PostgreSQL 与 Docker 真实集成任务；fork PR 保留离线检查。各次提交的实际结果见 [Actions](https://github.com/01jiyuge/signaldesk/actions/workflows/ci.yml)。
 没有使用真实模型、嵌入或远端 Reranker 密钥，也未上传 LangSmith；这些服务的效果仍需配置后验收。
 Docker 隔离与双实例 A2A 已实际运行。Compose 默认不开放 Docker socket，容器内 app 不自动获得宿主执行器权限；Sandbox 可先按原生 Python + Docker 路径运行。

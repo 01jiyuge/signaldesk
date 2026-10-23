@@ -186,13 +186,13 @@ async def test_large_report_uses_bounded_snapshot_with_http_fallback(setup):
 async def test_active_http_stream_observes_later_database_completion(setup, monkeypatch):
     client, repo, _, run = setup
     subscribed = asyncio.Event()
-    original = repo.list_events
+    original = repo.list_event_page
 
     async def observed_list_events(*args, **kwargs):
         subscribed.set()
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(repo, "list_events", observed_list_events)
+    monkeypatch.setattr(repo, "list_event_page", observed_list_events)
 
     async def complete_after_subscription():
         await subscribed.wait()
